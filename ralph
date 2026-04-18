@@ -1,0 +1,709 @@
+#!/usr/bin/env bash
+set -o pipefail
+
+# ralph — Automated TDD issue orchestrator
+#
+# Processes GitHub issues from a PRD with dependency ordering,
+# merge-back after each issue, and failure recovery via persistent state.
+#
+# Usage:
+#   ./ralph <prd-issue>                  Process all child issues of a PRD
+#   ./ralph run <issue> [iterations]     Process a single issue
+#   ./ralph status                       Show orchestration state
+#   ./ralph reset                        Clear saved state
+#
+# Environment:
+#   RALPH_ITERATIONS    Max TDD iterations per issue (default: 10)
+
+# ── Config ───────────────────────────────────────────────
+
+ITERATIONS="${RALPH_ITERATIONS:-10}"
+STATE_DIR=".ralph"
+WORKTREE_PREFIX="ralph"
+ISSUE_CACHE=""
+
+# ── Logging ──────────────────────────────────────────────
+
+RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
+BLUE='\033[0;34m'; BOLD='\033[1m'; DIM='\033[2m'; NC='\033[0m'
+
+log()    { echo -e "${BLUE}▸${NC} $*"; }
+ok()     { echo -e "${GREEN}✓${NC} $*"; }
+warn()   { echo -e "${YELLOW}⚠${NC} $*" >&2; }
+err()    { echo -e "${RED}✗${NC} $*" >&2; }
+header() { echo -e "\n${BOLD}── $* ──${NC}"; }
+
+# ── Preflight ────────────────────────────────────────────
+
+preflight() {
+  local missing=()
+  for cmd in gh jq git claude; do
+    command -v "$cmd" >/dev/null || missing+=("$cmd")
+  done
+  if [[ ${#missing[@]} -gt 0 ]]; then
+    err "Missing required tools: ${missing[*]}"
+    exit 1
+  fi
+  if ! git rev-parse --is-inside-work-tree &>/dev/null; then
+    err "Not inside a git repository"
+    exit 1
+  fi
+  if ((BASH_VERSINFO[0] < 4)); then
+    err "Bash 4+ required (have $BASH_VERSION). Install via: brew install bash"
+    exit 1
+  fi
+  git worktree prune 2>/dev/null || true
+}
+
+default_branch() {
+  git symbolic-ref refs/remotes/origin/HEAD 2>/dev/null \
+    | sed 's@^refs/remotes/origin/@@' \
+    || echo "main"
+}
+
+# ── State Management ─────────────────────────────────────
+#
+# State file tracks per-issue status so ralph can resume after
+# interruption. States: pending → in_progress → complete → reviewed → merged
+#                                            ↘ failed
+#                                   complete → review_failed
+#                                   reviewed → merge_failed
+
+state_file() { echo "$STATE_DIR/state.json"; }
+
+init_state() {
+  mkdir -p "$STATE_DIR"
+  [[ -f "$(state_file)" ]] || echo '{}' > "$(state_file)"
+}
+
+get_state() {
+  jq -r --arg i "$1" '.issues[$i] // "pending"' "$(state_file)"
+}
+
+set_state() {
+  local tmp; tmp=$(mktemp)
+  jq --arg i "$1" --arg s "$2" '.issues[$i] = $s' "$(state_file)" > "$tmp"
+  mv "$tmp" "$(state_file)"
+}
+
+save_meta() {
+  local tmp; tmp=$(mktemp)
+  jq --arg p "$1" '.prd = $p' "$(state_file)" > "$tmp"
+  mv "$tmp" "$(state_file)"
+}
+
+# ── Issue Discovery ──────────────────────────────────────
+#
+# Fetches all open issues once, then parses locally.
+# Child issues are identified by "Parent PRD" + "#<number>" in body
+# (the format prd-to-issues creates).
+# Blockers are parsed from the "## Blocked by" section.
+
+fetch_cache() {
+  ISSUE_CACHE=$(gh issue list --state open --limit 200 --json number,body,title)
+}
+
+discover_issues() {
+  local prd="$1"
+  echo "$ISSUE_CACHE" | jq -r --arg p "$prd" '
+    [.[] | select(.body != null)
+         | select((.body | test("Parent PRD")) and (.body | test("#\($p)([^0-9]|$)")))
+         | .number] | sort | .[]'
+}
+
+issue_title() {
+  echo "$ISSUE_CACHE" | jq -r --argjson n "$1" \
+    '.[] | select(.number == $n) | .title // ""'
+}
+
+issue_blockers() {
+  local body
+  body=$(echo "$ISSUE_CACHE" | jq -r --argjson n "$1" \
+    '.[] | select(.number == $n) | .body // ""')
+  echo "$body" \
+    | sed -n '/^## Blocked by/,/^## /p' \
+    | grep -oE '#[0-9]+' \
+    | tr -d '#' \
+    || true
+}
+
+issue_slug() {
+  echo "$1" \
+    | tr '[:upper:]' '[:lower:]' \
+    | sed 's/[^a-z0-9]/-/g; s/-\{2,\}/-/g; s/^-//; s/-$//' \
+    | cut -c1-40
+}
+
+# ── Single Issue Runner ──────────────────────────────────
+#
+# Runs Claude in a worktree with the TDD skill prompt.
+# Loops up to N iterations. Returns 0 if Claude signals COMPLETE,
+# 1 if max iterations exhausted.
+
+run_issue() {
+  local issue="$1" max="${2:-$ITERATIONS}" mode="${3:-build}"
+
+  # Resolve title (from cache or direct API call for single-issue mode)
+  local title
+  if [[ -n "$ISSUE_CACHE" ]]; then
+    title=$(issue_title "$issue")
+  fi
+  [[ -z "${title:-}" ]] && title=$(gh issue view "$issue" --json title -q '.title' 2>/dev/null || echo "")
+
+  local slug; slug=$(issue_slug "$title")
+  local worktree="${WORKTREE_PREFIX}/issue-${issue}-${slug}"
+
+  log "Running #${issue}: ${title} (mode: ${mode}, max ${max} iterations)"
+
+  # Ensure worktree branches from latest main
+  local main; main=$(default_branch)
+  git checkout "$main" &>/dev/null || true
+  git pull origin "$main" &>/dev/null || true
+
+  local prompt
+  if [[ "$mode" == "fix_review" ]]; then
+    # Find the PR for this issue
+    local pr
+    pr=$(gh pr list --state open --json number,title,body -q \
+      "[.[] | select((.title + \" \" + .body) | test(\"#${issue}([^0-9]|$)\")) | .number] | .[0] // empty" \
+      2>/dev/null || echo "")
+
+    read -r -d '' prompt <<PROMPT || true
+A code review has REJECTED PR #${pr} for issue #${issue}.
+
+1. Read the review comments on PR #${pr} using: gh pr view ${pr} --comments
+2. Read the GitHub issue #${issue} using: gh issue view ${issue}
+3. Read the current code that needs fixing.
+
+Your ONLY job is to fix the specific issues raised in the review comments. Do NOT rebuild from scratch. Do NOT rewrite components. Only fix what the reviewer asked for.
+
+For each review comment:
+1. Understand what the reviewer wants changed.
+2. Write a test for the fix (RED).
+3. Implement the fix (GREEN).
+4. Run all tests and type checks.
+5. Commit with a reference to #${issue}. Do NOT add Co-Authored-By lines to commits.
+6. Push to the PR branch.
+
+After fixing ALL review comments:
+- Run the full test suite and type checks.
+- Comment on issue #${issue} what you fixed.
+- Output <promise>COMPLETE</promise>.
+
+CRITICAL: ONLY output COMPLETE when ALL review comments are addressed, all tests pass, and type checks succeed.
+PROMPT
+  else
+    read -r -d '' prompt <<PROMPT || true
+Read GitHub issue #${issue} using gh cli for full context and progress (from comments).
+ALWAYS research the issue and related code before writing anything.
+After research, read and follow the TDD skill before writing any code.
+
+IMPORTANT: You are ONLY working on issue #${issue}. Do NOT touch other issues.
+
+On first iteration:
+  - Create a DRAFT PR referencing issue #${issue} after your first commit.
+
+Each iteration:
+1. Find the highest-priority incomplete task in issue #${issue}.
+2. Implement it using TDD (red-green-refactor).
+3. Run tests and type checks.
+4. Commit with a reference to #${issue}. Do NOT add Co-Authored-By lines to commits.
+5. Push to the PR branch.
+6. Comment progress on issue #${issue} via gh cli.
+
+Work on ONE task per iteration.
+
+CRITICAL: ONLY mark the PR as ready and output <promise>COMPLETE</promise> when:
+  - ALL acceptance criteria in the issue are met
+  - All tests pass and type checks succeed
+  - No remaining work
+If ANY doubt remains, do NOT output COMPLETE.
+PROMPT
+  fi
+
+  local stream_text='select(.type == "assistant") | .message.content[]? | select(.type == "text") | .text // empty | gsub("\n"; "\r\n") | . + "\r\n\n"'
+  local final_result='select(.type == "result") | .result // empty'
+
+  for ((i = 1; i <= max; i++)); do
+    log "  Iteration ${i}/${max}"
+    local tmp; tmp=$(mktemp)
+
+    if claude --dangerously-skip-permissions \
+         --worktree "$worktree" \
+         --verbose \
+         -p \
+         --output-format stream-json \
+         "$prompt" \
+       | grep --line-buffered '^{' \
+       | tee "$tmp" \
+       | jq --unbuffered -rj "$stream_text"; then
+      : # claude exited cleanly
+    else
+      warn "  Claude exited with error on iteration ${i}"
+    fi
+
+    local result
+    result=$(jq -r "$final_result" "$tmp" 2>/dev/null || echo "")
+
+    # Check for rate limit in output before cleaning up
+    if grep -q "hit your limit" "$tmp" 2>/dev/null; then
+      err "  Rate limit hit — stopping ralph. Resume after limit resets."
+      rm -f "$tmp"
+      exit 42  # Special exit code for rate limit
+    fi
+
+    rm -f "$tmp"
+
+    if [[ "$result" == *"<promise>COMPLETE</promise>"* ]]; then
+      ok "  Issue #${issue} complete after ${i} iteration(s)"
+      return 0
+    fi
+  done
+
+  warn "  Issue #${issue} incomplete after ${max} iterations"
+  return 1
+}
+
+# ── PR Review ────────────────────────────────────────────
+#
+# Spawns a separate Claude instance to review the PR before merging.
+# Reviews code quality, acceptance criteria, and best practices.
+# Returns 0 if approved, 1 if changes requested.
+
+review_issue() {
+  local issue="$1"
+
+  local pr
+  pr=$(gh pr list --state open --json number,title,body -q \
+    "[.[] | select((.title + \" \" + .body) | test(\"#${issue}([^0-9]|$)\")) | .number] | .[0] // empty" \
+    2>/dev/null || echo "")
+
+  if [[ -z "$pr" ]]; then
+    warn "  No open PR found for #${issue} to review"
+    return 2  # 2 = no PR found (distinct from 1 = review rejected)
+  fi
+
+  log "  Reviewing PR #${pr} for issue #${issue}"
+
+  local review_prompt
+  read -r -d '' review_prompt <<REVIEW || true
+You are reviewing PR #${pr} for issue #${issue}.
+
+1. Read the GitHub issue using: gh issue view ${issue}
+2. Read the PR diff using: gh pr diff ${pr}
+3. Read the PR files using: gh pr view ${pr} --json files
+
+Review for:
+- Does the code meet ALL acceptance criteria in the issue?
+- Code quality: clean, readable, no dead code, no debug logs
+- Are there any bugs, security issues, or performance problems?
+- Does it follow React/Next.js best practices?
+- Is it production-quality (not prototype/demo quality)?
+
+If the PR passes review, comment your approval on the PR and output <promise>APPROVED</promise>.
+If changes are needed, comment the required changes on the PR and output <promise>CHANGES_REQUESTED</promise>.
+
+Do NOT merge the PR. Only review it.
+REVIEW
+
+  local stream_text='select(.type == "assistant") | .message.content[]? | select(.type == "text") | .text // empty | gsub("\n"; "\r\n") | . + "\r\n\n"'
+  local final_result='select(.type == "result") | .result // empty'
+
+  local tmp; tmp=$(mktemp)
+
+  if claude --dangerously-skip-permissions \
+       --verbose \
+       -p \
+       --output-format stream-json \
+       "$review_prompt" \
+     | grep --line-buffered '^{' \
+     | tee "$tmp" \
+     | jq --unbuffered -rj "$stream_text"; then
+    : # claude exited cleanly
+  else
+    warn "  Review Claude exited with error"
+  fi
+
+  local result
+  result=$(jq -r "$final_result" "$tmp" 2>/dev/null || echo "")
+  rm -f "$tmp"
+
+  if [[ "$result" == *"<promise>APPROVED</promise>"* ]]; then
+    ok "  PR #${pr} approved"
+    return 0
+  else
+    warn "  PR #${pr} needs changes"
+    return 1
+  fi
+}
+
+# ── Merge Back ───────────────────────────────────────────
+#
+# Finds the PR created for an issue, merges it, syncs local main,
+# and closes the issue. Uses gh CLI so everything happens on GitHub.
+
+merge_issue() {
+  local issue="$1"
+  local main; main=$(default_branch)
+
+  log "Merging #${issue} → ${main}"
+
+  # Find open PR referencing this issue (search title + body)
+  local pr
+  pr=$(gh pr list --state open --json number,title,body -q \
+    "[.[] | select((.title + \" \" + .body) | test(\"#${issue}([^0-9]|$)\")) | .number] | .[0] // empty" \
+    2>/dev/null || echo "")
+
+  if [[ -z "$pr" ]]; then
+    warn "  No open PR found for #${issue}"
+    return 1
+  fi
+
+  log "  Merging PR #${pr}"
+  gh pr merge "$pr" --merge --delete-branch 2>/dev/null || true
+
+  # Verify the PR actually merged (don't trust exit code — branch cleanup
+  # failures return non-zero even when the merge itself succeeded)
+  local pr_state
+  pr_state=$(gh pr view "$pr" --json state -q '.state' 2>/dev/null || echo "")
+  if [[ "$pr_state" != "MERGED" ]]; then
+    err "  Failed to merge PR #${pr} (state: ${pr_state})"
+    return 1
+  fi
+
+  # Sync local main so next worktree branches from updated code
+  git fetch origin "$main" &>/dev/null
+  git checkout "$main" &>/dev/null || true
+  git pull origin "$main" &>/dev/null
+
+  # Close the issue with a reference to the merged PR
+  gh issue close "$issue" \
+    --comment "Completed and merged via PR #${pr}." &>/dev/null || true
+
+  ok "  PR #${pr} merged, issue #${issue} closed"
+}
+
+# ── Orchestrator ─────────────────────────────────────────
+#
+# Core loop: discovers issues, builds dependency graph, then
+# iteratively processes unblocked issues (Kahn's algorithm).
+# After each issue completes, its branch is merged back to main
+# so dependent issues see the new code.
+
+orchestrate() {
+  local prd="$1"
+
+  preflight
+  init_state
+  save_meta "$prd"
+
+  trap 'warn "Interrupted — state saved. Resume: ./ralph '"$prd"'"; exit 130' INT TERM
+
+  header "Fetching issues for PRD #${prd}"
+  fetch_cache
+
+  local issues=()
+  while IFS= read -r n; do
+    [[ -n "$n" ]] && issues+=("$n")
+  done <<< "$(discover_issues "$prd")"
+
+  if [[ ${#issues[@]} -eq 0 ]]; then
+    err "No child issues found for PRD #${prd}"
+    err "Issues must contain 'Parent PRD' and '#${prd}' in their body"
+    exit 1
+  fi
+
+  log "Found ${#issues[@]} issue(s): ${issues[*]}"
+
+  # Build dependency map and lookup set
+  header "Analyzing dependencies"
+  declare -A blockers issue_set
+  for issue in "${issues[@]}"; do
+    issue_set[$issue]=1
+    blockers[$issue]=$(issue_blockers "$issue" | tr '\n' ' ' | xargs)
+    local deps="${blockers[$issue]:-}"
+    local title; title=$(issue_title "$issue")
+    if [[ -n "$deps" ]]; then
+      log "  #${issue} ${title} ${DIM}← blocked by ${deps}${NC}"
+    else
+      log "  #${issue} ${title} ${DIM}← ready${NC}"
+    fi
+  done
+
+  # Dynamic execution loop
+  header "Executing"
+  local total=0 merged=0 failed=0 skipped=0
+
+  while true; do
+    local unblocked=() pending=0
+
+    for issue in "${issues[@]}"; do
+      local state; state=$(get_state "$issue")
+      [[ "$state" == "merged" || "$state" == "failed" ]] && continue
+      pending=$((pending + 1))
+
+      # Check if all in-set blockers are merged
+      local blocked=false
+      for dep in ${blockers[$issue]:-}; do
+        [[ "$dep" == "$issue" ]] && continue
+        if [[ -n "${issue_set[$dep]:-}" ]] && [[ "$(get_state "$dep")" != "merged" ]]; then
+          blocked=true
+          break
+        fi
+      done
+
+      $blocked || unblocked+=("$issue")
+    done
+
+    # All done
+    [[ $pending -eq 0 ]] && break
+
+    # Deadlock: remaining issues blocked by failures
+    if [[ ${#unblocked[@]} -eq 0 ]]; then
+      warn "Remaining issues blocked by failed dependencies:"
+      for issue in "${issues[@]}"; do
+        local state; state=$(get_state "$issue")
+        [[ "$state" != "merged" ]] && err "  #${issue}: ${state}"
+      done
+      break
+    fi
+
+    log "Unblocked: ${unblocked[*]}"
+
+    for issue in "${unblocked[@]}"; do
+      local state; state=$(get_state "$issue")
+      total=$((total + 1))
+
+      # Previously completed but merge failed — retry merge (max 3 attempts)
+      if [[ "$state" == "complete" || "$state" == "merge_failed" || "$state" == "reviewed" ]]; then
+        local merge_retries; merge_retries=$(jq -r --arg i "$issue" '.merge_retries[$i] // 0' "$(state_file)")
+        if (( merge_retries >= 3 )); then
+          err "  Issue #${issue} exceeded merge retry limit — needs human attention"
+          set_state "$issue" "failed"
+          failed=$((failed + 1))
+          continue
+        fi
+        # Increment retry count
+        local tmp_mr; tmp_mr=$(mktemp)
+        jq --arg i "$issue" --argjson r "$((merge_retries + 1))" '.merge_retries[$i] = $r' "$(state_file)" > "$tmp_mr"
+        mv "$tmp_mr" "$(state_file)"
+
+        log "Retrying merge for #${issue} (attempt $((merge_retries + 1))/3)"
+        if merge_issue "$issue"; then
+          set_state "$issue" "merged"
+          merged=$((merged + 1))
+        else
+          set_state "$issue" "merge_failed"
+          failed=$((failed + 1))
+        fi
+        continue
+      fi
+
+      # Resume from review_failed — fix review comments, then re-review
+      if [[ "$state" == "review_failed" ]]; then
+        local max_review_cycles=3
+        local issue_done=false
+
+        log "  Resuming review fix for #${issue}"
+        if run_issue "$issue" "$ITERATIONS" "fix_review"; then
+          set_state "$issue" "complete"
+
+          for ((cycle = 1; cycle <= max_review_cycles; cycle++)); do
+            log "  Review cycle ${cycle}/${max_review_cycles} for #${issue}"
+
+            review_issue "$issue"
+            local review_rc=$?
+
+            if [[ $review_rc -eq 0 ]]; then
+              set_state "$issue" "reviewed"
+              if merge_issue "$issue"; then
+                set_state "$issue" "merged"
+                merged=$((merged + 1))
+                issue_done=true
+              else
+                set_state "$issue" "merge_failed"
+                failed=$((failed + 1))
+                issue_done=true
+              fi
+              break
+            elif [[ $review_rc -eq 2 ]]; then
+              err "  No PR found for #${issue} — cannot review"
+              set_state "$issue" "failed"
+              failed=$((failed + 1))
+              issue_done=true
+              break
+            else
+              log "  Review failed again for #${issue} — fixing (cycle ${cycle})"
+              set_state "$issue" "review_failed"
+              if ! run_issue "$issue" "$ITERATIONS" "fix_review"; then
+                err "  TDD fix failed for #${issue}"
+                set_state "$issue" "failed"
+                failed=$((failed + 1))
+                issue_done=true
+                break
+              fi
+              set_state "$issue" "complete"
+            fi
+          done
+
+          if ! $issue_done; then
+            err "  Issue #${issue} failed after ${max_review_cycles} review cycles"
+            set_state "$issue" "review_failed"
+            failed=$((failed + 1))
+          fi
+        else
+          set_state "$issue" "failed"
+          failed=$((failed + 1))
+        fi
+        continue
+      fi
+
+      # Full run: TDD build → review → fix loop → merge
+      set_state "$issue" "in_progress"
+      local max_review_cycles=3
+      local issue_done=false
+
+      if run_issue "$issue" "$ITERATIONS"; then
+        set_state "$issue" "complete"
+
+        # Reset merge retries for a fresh run
+        local tmp_reset; tmp_reset=$(mktemp)
+        jq --arg i "$issue" '.merge_retries[$i] = 0' "$(state_file)" > "$tmp_reset"
+        mv "$tmp_reset" "$(state_file)"
+
+        # Review/fix loop: review PR, if it fails, fix and review again
+        for ((cycle = 1; cycle <= max_review_cycles; cycle++)); do
+          log "  Review cycle ${cycle}/${max_review_cycles} for #${issue}"
+
+          review_issue "$issue"
+          local review_rc=$?
+
+          if [[ $review_rc -eq 0 ]]; then
+            # Review passed
+            set_state "$issue" "reviewed"
+            if merge_issue "$issue"; then
+              set_state "$issue" "merged"
+              merged=$((merged + 1))
+              issue_done=true
+            else
+              set_state "$issue" "merge_failed"
+              failed=$((failed + 1))
+              issue_done=true
+            fi
+            break
+          elif [[ $review_rc -eq 2 ]]; then
+            # No PR found — cannot review, treat as error
+            err "  No PR found for #${issue} — cannot review"
+            set_state "$issue" "failed"
+            failed=$((failed + 1))
+            issue_done=true
+            break
+          else
+            # Review rejected — run TDD again to fix ONLY the review comments
+            log "  Review failed for #${issue} — running TDD to fix review comments (cycle ${cycle})"
+            set_state "$issue" "review_failed"
+            if ! run_issue "$issue" "$ITERATIONS" "fix_review"; then
+              err "  TDD fix failed for #${issue} after review cycle ${cycle}"
+              set_state "$issue" "failed"
+              failed=$((failed + 1))
+              issue_done=true
+              break
+            fi
+            set_state "$issue" "complete"
+          fi
+        done
+
+        # Exhausted review cycles without passing
+        if ! $issue_done; then
+          err "  Issue #${issue} failed after ${max_review_cycles} review cycles — needs human attention"
+          set_state "$issue" "review_failed"
+          failed=$((failed + 1))
+        fi
+      else
+        set_state "$issue" "failed"
+        failed=$((failed + 1))
+      fi
+    done
+  done
+
+  # Summary
+  header "Summary"
+  ok "Merged: ${merged}"
+  [[ $skipped -gt 0 ]] && log "Skipped (already done): ${skipped}"
+  if [[ $failed -gt 0 ]]; then
+    err "Failed: ${failed}"
+    warn "Fix issues and resume: ./ralph ${prd}"
+  else
+    ok "All issues processed successfully"
+  fi
+
+  return $(( failed > 0 ? 1 : 0 ))
+}
+
+# ── Status Display ───────────────────────────────────────
+
+show_status() {
+  init_state
+  if ! jq -e '.prd' "$(state_file)" &>/dev/null; then
+    log "No orchestration in progress"
+    return
+  fi
+
+  header "Orchestration State"
+  jq -r '
+    "PRD #\(.prd // "unknown")\n",
+    (.issues // {} | to_entries | sort_by(.key | tonumber) | .[] |
+      (if   .value == "merged"       then "  \u001b[32m✓\u001b[0m"
+       elif .value == "reviewed"     then "  ◆"
+       elif .value == "review_failed" then "  \u001b[33m◇\u001b[0m"
+       elif .value == "complete"     then "  ●"
+       elif .value == "in_progress"  then "  ▸"
+       elif .value == "failed"       then "  \u001b[31m✗\u001b[0m"
+       elif .value == "merge_failed" then "  \u001b[33m⚠\u001b[0m"
+       else "  ○" end) + " #\(.key): \(.value)")
+  ' "$(state_file)"
+}
+
+# ── CLI ──────────────────────────────────────────────────
+
+usage() {
+  cat <<'EOF'
+ralph — Automated TDD issue orchestrator
+
+Usage:
+  ./ralph <prd-issue>                  Process all child issues of a PRD
+  ./ralph run <issue> [iterations]     Process a single issue
+  ./ralph status                       Show orchestration state
+  ./ralph reset                        Clear saved state
+
+Environment:
+  RALPH_ITERATIONS    Max TDD iterations per issue (default: 10)
+EOF
+}
+
+case "${1:-}" in
+  run)
+    [[ -z "${2:-}" ]] && { usage; exit 1; }
+    preflight
+    run_issue "$2" "${3:-$ITERATIONS}"
+    ;;
+  status)
+    show_status
+    ;;
+  reset)
+    rm -rf "$STATE_DIR"
+    ok "State cleared"
+    ;;
+  -h|--help|"")
+    usage
+    ;;
+  *)
+    if [[ "$1" =~ ^[0-9]+$ ]]; then
+      orchestrate "$1"
+    else
+      err "Unknown command: $1"
+      usage
+      exit 1
+    fi
+    ;;
+esac
