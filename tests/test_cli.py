@@ -24,6 +24,7 @@ def test_cli_runs_end_to_end_and_writes_lifecycle_events(tmp_path):
 
     env = os.environ.copy()
     env["SMART_RALPH_RALPH_PATH"] = str(FIXTURES / "echo_stdout.sh")
+    env["SMART_RALPH_REQUIRED_TOOLS"] = "git"
     # /usr/bin/env python3 in the shebang must resolve to the venv's python
     # so the installed deps (rich, pydantic) are available.
     venv_bin = REPO / ".venv" / "bin"
@@ -58,3 +59,47 @@ def test_cli_runs_end_to_end_and_writes_lifecycle_events(tmp_path):
 
     # non-TTY stdout → plain-text dashboard → ralph's stdout line surfaces
     assert "iteration: start prd=17" in result.stdout
+
+
+def test_cli_rejects_non_numeric_prd(tmp_path):
+    _init_repo(tmp_path)
+    env = os.environ.copy()
+    env["SMART_RALPH_RALPH_PATH"] = str(FIXTURES / "echo_stdout.sh")
+    env["SMART_RALPH_REQUIRED_TOOLS"] = "git"
+    venv_bin = REPO / ".venv" / "bin"
+    env["PATH"] = f"{venv_bin}{os.pathsep}{env.get('PATH', '')}"
+
+    result = subprocess.run(
+        [str(SMART_RALPH), "docs/spec.md"],
+        cwd=tmp_path,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+
+    assert result.returncode == 2, result.stderr
+    assert "issue" in result.stderr.lower() or "integer" in result.stderr.lower()
+    # no run.lock, no events.jsonl — aborted before any state was created
+    assert not (tmp_path / ".smart-ralph" / "run.lock").exists()
+    assert not (tmp_path / ".smart-ralph" / "events.jsonl").exists()
+
+
+def test_cli_rejects_zero_or_negative_prd(tmp_path):
+    _init_repo(tmp_path)
+    env = os.environ.copy()
+    env["SMART_RALPH_RALPH_PATH"] = str(FIXTURES / "echo_stdout.sh")
+    env["SMART_RALPH_REQUIRED_TOOLS"] = "git"
+    venv_bin = REPO / ".venv" / "bin"
+    env["PATH"] = f"{venv_bin}{os.pathsep}{env.get('PATH', '')}"
+
+    for bad in ["0", "-5"]:
+        result = subprocess.run(
+            [str(SMART_RALPH), bad],
+            cwd=tmp_path,
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        assert result.returncode == 2, f"{bad}: {result.stderr}"

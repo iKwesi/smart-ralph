@@ -38,7 +38,7 @@ def test_lockfile_is_created_during_run_and_removed_on_exit(tmp_path):
         required_tools=_all_tools_present(),
     )
 
-    exit_code, events = supervisor.run(prd="9")
+    exit_code, events = supervisor.run(issue=9)
 
     assert exit_code == 0
     lock_path = tmp_path / ".smart-ralph" / "run.lock"
@@ -72,7 +72,7 @@ def test_second_run_errors_when_lockfile_exists(tmp_path):
     )
 
     with pytest.raises(ConcurrentRunError) as exc:
-        supervisor.run(prd="10")
+        supervisor.run(issue=10)
     assert "already running" in str(exc.value).lower()
 
     # the other run's lockfile is NOT clobbered
@@ -88,7 +88,7 @@ def test_missing_required_tool_aborts_before_spawn(tmp_path):
     )
 
     with pytest.raises(HealthCheckError) as exc:
-        supervisor.run(prd="11")
+        supervisor.run(issue=11)
 
     msg = str(exc.value)
     assert "definitely-not-a-real-tool-xyzzy" in msg
@@ -106,7 +106,7 @@ def test_lifecycle_events_written_in_order(tmp_path):
         required_tools=_all_tools_present(),
     )
 
-    supervisor.run(prd="12")
+    supervisor.run(issue=12)
 
     events_path = tmp_path / ".smart-ralph" / "events.jsonl"
     assert events_path.exists()
@@ -208,7 +208,7 @@ def test_retention_prunes_old_runs_on_startup(tmp_path):
         retention_runs=2,
     )
 
-    supervisor.run(prd="16")
+    supervisor.run(issue=16)
 
     entries = [json.loads(line) for line in events_path.read_text().splitlines()]
     run_ids = list({e["run_id"]: None for e in entries}.keys())
@@ -224,3 +224,62 @@ def test_retention_prunes_old_runs_on_startup(tmp_path):
     }]
     assert "run_started" in current_types
     assert "run_ended" in current_types
+
+
+def test_kill_exception_on_sigint_is_logged_as_repair_failed(tmp_path, monkeypatch):
+    """If RalphClient.kill raises during SIGINT, the failure must be audit-logged
+    (not silently swallowed) and the run must still exit cleanly."""
+    import signal
+    import sys
+    import time as _time
+
+    _init_repo(tmp_path)
+
+    # inject a helper that monkey-patches RalphProcess.kill to raise
+    helper = tmp_path / "run_with_broken_kill.py"
+    helper.write_text(
+        "import sys\n"
+        "from pathlib import Path\n"
+        "from smart_ralph import ralph_client\n"
+        "from smart_ralph.supervisor import Supervisor\n"
+        "\n"
+        "orig_kill = ralph_client.RalphProcess.kill\n"
+        "def broken_kill(self, issue):\n"
+        "    raise RuntimeError('git binary missing')\n"
+        "ralph_client.RalphProcess.kill = broken_kill\n"
+        "\n"
+        "s = Supervisor(\n"
+        f"    ralph_path=Path({str(FIXTURES / 'long_running.sh')!r}),\n"
+        f"    cwd=Path({str(tmp_path)!r}),\n"
+        "    required_tools=['git'],\n"
+        ")\n"
+        "sys.exit(s.run(issue=42)[0])\n"
+    )
+
+    proc = subprocess.Popen(
+        [sys.executable, str(helper)],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+    )
+
+    lock = tmp_path / ".smart-ralph" / "run.lock"
+    deadline = _time.time() + 5.0
+    while _time.time() < deadline and not lock.exists():
+        _time.sleep(0.05)
+    assert lock.exists()
+
+    proc.send_signal(signal.SIGINT)
+    exit_code = proc.wait(timeout=10.0)
+    assert exit_code == 130
+
+    events = [
+        json.loads(line)
+        for line in (tmp_path / ".smart-ralph" / "events.jsonl")
+        .read_text()
+        .splitlines()
+    ]
+    repair_failed = [e for e in events if e["type"] == "repair_failed"]
+    assert len(repair_failed) == 1
+    assert repair_failed[0]["payload"]["op"] == "kill_and_stash"
+    assert "git binary missing" in repair_failed[0]["payload"]["error"]
+    # run_ended still written
+    assert events[-1]["type"] == "run_ended"

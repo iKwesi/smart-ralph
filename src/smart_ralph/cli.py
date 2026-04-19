@@ -18,9 +18,24 @@ DEFAULT_REQUIRED_TOOLS = ["ralph", "claude", "gh", "jq", "git"]
 def main(argv: list[str] | None = None) -> int:
     argv = list(argv if argv is not None else sys.argv[1:])
     if len(argv) != 1:
-        print("usage: smart-ralph <prd>", file=sys.stderr)
+        print("usage: smart-ralph <issue-number>", file=sys.stderr)
         return 2
-    prd = argv[0]
+    raw = argv[0]
+    try:
+        issue = int(raw)
+    except ValueError:
+        print(
+            f"error: PRD must be a GitHub issue number (positive integer); "
+            f"got {raw!r}",
+            file=sys.stderr,
+        )
+        return 2
+    if issue <= 0:
+        print(
+            f"error: issue number must be positive; got {issue}",
+            file=sys.stderr,
+        )
+        return 2
 
     ralph_override = os.environ.get("SMART_RALPH_RALPH_PATH")
     if ralph_override:
@@ -35,9 +50,6 @@ def main(argv: list[str] | None = None) -> int:
     tools_env = os.environ.get("SMART_RALPH_REQUIRED_TOOLS")
     if tools_env is not None:
         required_tools = [t.strip() for t in tools_env.split(",") if t.strip()]
-    elif ralph_override:
-        # in-test: the test supplies its own ralph, don't demand claude/gh/jq
-        required_tools = ["git"]
     else:
         required_tools = DEFAULT_REQUIRED_TOOLS
 
@@ -49,7 +61,7 @@ def main(argv: list[str] | None = None) -> int:
     dashboard = Dashboard(stream=sys.stdout)
 
     try:
-        exit_code, events = supervisor.run(prd=prd)
+        exit_code, events = supervisor.run(issue=issue)
     except HealthCheckError as e:
         print(f"health check failed: {e}", file=sys.stderr)
         return 2

@@ -18,7 +18,7 @@ class EventLog:
     def append(
         self,
         *,
-        type: str,
+        event_type: str,
         source: str,
         issue: int | None,
         payload: dict[str, Any],
@@ -28,7 +28,7 @@ class EventLog:
             "schema_version": SCHEMA_VERSION,
             "ts": _now_iso_ms(),
             "run_id": self._run_id,
-            "type": type,
+            "type": event_type,
             "source": source,
             "issue": issue,
             "payload": payload,
