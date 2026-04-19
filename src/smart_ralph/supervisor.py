@@ -75,19 +75,19 @@ class Supervisor:
         try:
             log.append(
                 type="run_started", source="supervisor",
-                issue=issue, payload={"prd": prd},
+                issue=issue, payload={"prd": prd}, sync=True,
             )
             client = RalphClient(ralph_path=self._ralph_path, cwd=self._cwd)
             process = client.spawn(prd=prd)
             log.append(
                 type="ralph_spawned", source="supervisor",
-                issue=issue, payload={"pid": process.pid},
+                issue=issue, payload={"pid": process.pid}, sync=True,
             )
             events = list(process.events())
             exit_code = process.wait()
             log.append(
                 type="ralph_exited", source="supervisor",
-                issue=issue, payload={"exit_code": exit_code},
+                issue=issue, payload={"exit_code": exit_code}, sync=True,
             )
             return exit_code, events
         except KeyboardInterrupt:
@@ -98,14 +98,16 @@ class Supervisor:
                     pass
                 log.append(
                     type="ralph_exited", source="supervisor",
-                    issue=issue, payload={"exit_code": -2, "reason": "sigint"},
+                    issue=issue,
+                    payload={"exit_code": -2, "reason": "sigint"},
+                    sync=True,
                 )
             exit_code = 130
             return exit_code, events
         finally:
             log.append(
                 type="run_ended", source="supervisor",
-                issue=issue, payload={"exit_code": exit_code},
+                issue=issue, payload={"exit_code": exit_code}, sync=True,
             )
             if lock_path.exists():
                 lock_path.unlink()
