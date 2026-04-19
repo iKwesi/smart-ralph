@@ -22,6 +22,7 @@ class EventLog:
         source: str,
         issue: int | None,
         payload: dict[str, Any],
+        sync: bool = False,
     ) -> None:
         envelope = {
             "schema_version": SCHEMA_VERSION,
@@ -36,6 +37,8 @@ class EventLog:
         fd = os.open(self._path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
         try:
             os.write(fd, line.encode("utf-8"))
+            if sync:
+                os.fsync(fd)
         finally:
             os.close(fd)
 
