@@ -40,7 +40,11 @@ class Supervisor:
         self._required_tools = required_tools
         self._retention_runs = retention_runs
 
-    def run(self, prd: str) -> tuple[int, list[dict]]:
+    def run(self, issue: int) -> tuple[int, list[dict]]:
+        if not isinstance(issue, int) or issue <= 0:
+            raise ValueError(
+                f"issue must be a positive integer; got {issue!r}"
+            )
         missing = [t for t in self._required_tools if shutil.which(t) is None]
         if missing:
             raise HealthCheckError(
@@ -67,37 +71,41 @@ class Supervisor:
         run_id = uuid.uuid4().hex[:16]
         log = EventLog(meta_dir / "events.jsonl", run_id=run_id)
         log.prune_runs(keep=self._retention_runs)
-        issue = _issue_from_prd(prd)
         process = None
         exit_code = 1
         events: list[dict] = []
 
         try:
             log.append(
-                type="run_started", source="supervisor",
-                issue=issue, payload={"prd": prd}, sync=True,
+                event_type="run_started", source="supervisor",
+                issue=issue, payload={"issue": issue}, sync=True,
             )
             client = RalphClient(ralph_path=self._ralph_path, cwd=self._cwd)
-            process = client.spawn(prd=prd)
+            process = client.spawn(issue=issue)
             log.append(
-                type="ralph_spawned", source="supervisor",
+                event_type="ralph_spawned", source="supervisor",
                 issue=issue, payload={"pid": process.pid}, sync=True,
             )
             events = list(process.events())
             exit_code = process.wait()
             log.append(
-                type="ralph_exited", source="supervisor",
+                event_type="ralph_exited", source="supervisor",
                 issue=issue, payload={"exit_code": exit_code}, sync=True,
             )
             return exit_code, events
         except KeyboardInterrupt:
             if process is not None:
                 try:
-                    process.kill(issue=issue or 0)
-                except Exception:
-                    pass
+                    process.kill(issue=issue)
+                except Exception as e:
+                    log.append(
+                        event_type="repair_failed", source="supervisor",
+                        issue=issue,
+                        payload={"op": "kill_and_stash", "error": str(e)},
+                        sync=True,
+                    )
                 log.append(
-                    type="ralph_exited", source="supervisor",
+                    event_type="ralph_exited", source="supervisor",
                     issue=issue,
                     payload={"exit_code": -2, "reason": "sigint"},
                     sync=True,
@@ -106,15 +114,8 @@ class Supervisor:
             return exit_code, events
         finally:
             log.append(
-                type="run_ended", source="supervisor",
+                event_type="run_ended", source="supervisor",
                 issue=issue, payload={"exit_code": exit_code}, sync=True,
             )
             if lock_path.exists():
                 lock_path.unlink()
-
-
-def _issue_from_prd(prd: str) -> int | None:
-    try:
-        return int(prd)
-    except ValueError:
-        return None

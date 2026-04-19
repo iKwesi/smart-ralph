@@ -61,9 +61,9 @@ class RalphClient:
         self._ralph_path = Path(ralph_path)
         self._cwd = Path(cwd)
 
-    def spawn(self, prd: str) -> RalphProcess:
+    def spawn(self, issue: int) -> RalphProcess:
         proc = subprocess.Popen(
-            [str(self._ralph_path), prd],
+            [str(self._ralph_path), str(issue)],
             cwd=self._cwd,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,

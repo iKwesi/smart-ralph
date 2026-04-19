@@ -24,7 +24,7 @@ def test_spawn_yields_stdout_lines_as_events(tmp_path):
         cwd=tmp_path,
     )
 
-    process = client.spawn(prd="2")
+    process = client.spawn(issue=2)
     events = list(process.events())
     exit_code = process.wait()
 
@@ -44,7 +44,7 @@ def test_events_merges_ralph_events_jsonl(tmp_path):
         cwd=tmp_path,
     )
 
-    process = client.spawn(prd="7")
+    process = client.spawn(issue=7)
     events = list(process.events())
     process.wait()
 
@@ -58,7 +58,7 @@ def test_events_merges_ralph_events_jsonl(tmp_path):
     ralph_events = [e for e in events if e["type"] == "ralph_event"]
     types = [e["payload"]["type"] for e in ralph_events]
     assert types == ["ralph_iteration_started", "ralph_iteration_ended"]
-    assert ralph_events[0]["payload"]["payload"]["prd"] == "7"
+    assert ralph_events[0]["payload"]["payload"]["prd"] == "7"  # stub passes the raw arg
     assert ralph_events[1]["payload"]["payload"]["ok"] is True
 
     # sanity: .ralph/events.jsonl actually got written
@@ -76,7 +76,7 @@ def test_kill_terminates_process_and_stashes_uncommitted(tmp_path):
         ralph_path=FIXTURES / "long_running.sh",
         cwd=tmp_path,
     )
-    process = client.spawn(prd="8")
+    process = client.spawn(issue=8)
 
     # drain events in the background so the pipe doesn't block
     events: list = []
