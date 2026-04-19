@@ -159,9 +159,61 @@ def test_oversized_payload_written_to_blob_sidecar(tmp_path):
     blob_path = events_root / blob_rel
     assert blob_path.exists(), f"blob not at {blob_path}"
     assert blob_rel.startswith("blobs/run-test-1/"), blob_rel
+
+    # Filename must be shell/filesystem-safe on every platform — BSD `date`
+    # silently outputs the literal string "%N" when asked for nanoseconds,
+    # which would leak a "%" character into the blob path.
+    import re
+    blob_basename = blob_path.name
+    assert re.fullmatch(r"[A-Za-z0-9._-]+", blob_basename), (
+        f"unsafe blob filename: {blob_basename!r}"
+    )
+
     # Full original payload recoverable from the blob.
     recovered = json.loads(blob_path.read_text())
     assert recovered == {"log": big_text}
+
+
+def test_blob_filename_is_safe_under_bsd_date(tmp_path):
+    """BSD `date` (macOS default) emits the literal string "%N" when asked
+    for nanoseconds. The blob filename must never contain a "%" — otherwise
+    it leaks into paths, URLs, and shell globs in unpredictable ways."""
+    # Shim `date` so any format string containing %N emits `<seconds>%N`
+    # verbatim, exactly the way BSD date behaves on unmodified macOS.
+    shim_dir = tmp_path / "bsd-date-shim"
+    shim_dir.mkdir()
+    shim = shim_dir / "date"
+    shim.write_text(
+        '#!/usr/bin/env bash\n'
+        '# BSD-date mimic: any %N token prints literally.\n'
+        'for a in "$@"; do\n'
+        '  case "$a" in\n'
+        '    *%N*) echo "$(/bin/date -u +%s)%N" ; exit 0 ;;\n'
+        '  esac\n'
+        'done\n'
+        'exec /bin/date "$@"\n'
+    )
+    shim.chmod(0o755)
+
+    # Force bash-builtin timestamp path (no gdate, no GNU date detection).
+    payload_json = json.dumps({"log": "x" * 5000})
+    events_path = tmp_path / ".smart-ralph" / "events.jsonl"
+    env = {
+        "PATH": f"{shim_dir}:/usr/bin:/bin",  # shim first, no gdate available
+        "SMART_RALPH_RUN_ID": "run-bsd",
+        "SMART_RALPH_EVENTS_PATH": str(events_path),
+    }
+    script = f"source {LIB} && emit_event ralph_error 9 {payload_json!r}"
+    result = subprocess.run(
+        ["bash", "-c", script],
+        env=env, cwd=tmp_path, capture_output=True, text=True, check=False,
+    )
+    assert result.returncode == 0, result.stderr
+
+    evt = json.loads(events_path.read_text().splitlines()[0])
+    blob_rel = evt["payload"]["blob_ref"]
+    assert "%" not in blob_rel, f"blob filename leaked literal %N: {blob_rel}"
+    assert (tmp_path / ".smart-ralph" / blob_rel).exists()
 
 
 def test_multibyte_payload_offloaded_when_bytes_exceed_4kb(tmp_path):

@@ -14,6 +14,11 @@
 # Envelope schema version — must match src/smart_ralph/eventlog.py.
 RALPH_EVENTS_SCHEMA_VERSION=1
 
+# Char-count threshold above which we fall through to a byte-accurate
+# check. UTF-8 is at most 4 bytes per char, so any line with ≤1024 chars
+# cannot exceed the 4KB PIPE_BUF window. Above that, fall through.
+RALPH_EVENTS_BYTE_CHECK_CHAR_THRESHOLD=1024
+
 # _ralph_ts — emit ISO 8601 UTC timestamp.
 #
 # Prefers GNU date / gdate for millisecond precision; falls back to bash's
@@ -21,25 +26,21 @@ RALPH_EVENTS_SCHEMA_VERSION=1
 # The backend is probed once and memoized in _RALPH_TS_IMPL.
 _ralph_ts() {
   if [[ -z "${_RALPH_TS_IMPL:-}" ]]; then
+    # Probe the exact format we'll use (+%3N) rather than +%N — some
+    # BSD-derived dates accept %N but reject precision modifiers like %3N.
     if command -v gdate >/dev/null 2>&1; then
       _RALPH_TS_IMPL="gdate"
-    elif [[ "$(date -u +%N 2>/dev/null)" =~ ^[0-9]{9}$ ]]; then
+    elif [[ "$(date -u +%3N 2>/dev/null)" =~ ^[0-9]{3}$ ]]; then
       _RALPH_TS_IMPL="gnu-date"
     else
       _RALPH_TS_IMPL="bash-builtin"
     fi
-    export _RALPH_TS_IMPL
   fi
   case "$_RALPH_TS_IMPL" in
     gdate)        gdate -u +"%Y-%m-%dT%H:%M:%S.%3NZ" ;;
     gnu-date)     date -u +"%Y-%m-%dT%H:%M:%S.%3NZ" ;;
     bash-builtin) printf '%(%Y-%m-%dT%H:%M:%S.000Z)T' -1 ;;
   esac
-}
-
-# _ralph_byte_len — byte count of stdin, locale-independent.
-_ralph_byte_len() {
-  wc -c
 }
 
 # emit_event <type> <issue|""> [<payload_json>]
@@ -80,17 +81,29 @@ emit_event() {
     --argjson payload "$payload_json" \
     '{schema_version:$sv, ts:$ts, run_id:$rid, type:$type, source:"ralph", issue:$issue, payload:$payload}')
 
-  # Byte-accurate size check: UTF-8 multi-byte chars can push a line past
-  # PIPE_BUF even when char count is under the limit. ${#line} is chars;
-  # wc -c is bytes.
-  local line_bytes
-  line_bytes=$(printf '%s\n' "$line" | _ralph_byte_len)
-  if (( line_bytes > 4096 )); then
+  # Fast path: if char count is well under 4KB, byte count cannot exceed
+  # 4KB either (UTF-8 is at most 4 bytes/char and almost all payloads are
+  # mostly ASCII). Only fork wc -c when we're close enough that multi-byte
+  # content could matter.
+  local needs_offload=0
+  if (( ${#line} + 1 > 4096 )); then
+    needs_offload=1
+  elif (( ${#line} + 1 > RALPH_EVENTS_BYTE_CHECK_CHAR_THRESHOLD )); then
+    local line_bytes
+    line_bytes=$(printf '%s\n' "$line" | wc -c)
+    (( line_bytes > 4096 )) && needs_offload=1
+  fi
+
+  if (( needs_offload )); then
     local events_root blob_dir blob_rel blob_path blob_name
     events_root=$(dirname "$events_path")
     blob_dir="$events_root/blobs/$SMART_RALPH_RUN_ID"
     mkdir -p "$blob_dir"
-    blob_name="$(date -u +%s%N 2>/dev/null || date -u +%s)-$$.json"
+    # Uniqueness comes from (ts digits) + pid + $RANDOM — portable across
+    # BSD and GNU date since we reuse _ralph_ts and strip non-digits.
+    local ts_digits
+    ts_digits=$(_ralph_ts | tr -dc '0-9')
+    blob_name="${ts_digits}-$$-${RANDOM}.json"
     blob_path="$blob_dir/$blob_name"
     printf '%s' "$payload_json" > "$blob_path"
 
