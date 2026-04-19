@@ -24,15 +24,10 @@ def main(argv: list[str] | None = None) -> int:
     try:
         issue = int(raw)
     except ValueError:
-        print(
-            f"error: PRD must be a GitHub issue number (positive integer); "
-            f"got {raw!r}",
-            file=sys.stderr,
-        )
-        return 2
+        issue = 0
     if issue <= 0:
         print(
-            f"error: issue number must be positive; got {issue}",
+            f"error: issue number must be a positive integer; got {raw!r}",
             file=sys.stderr,
         )
         return 2
@@ -63,7 +58,7 @@ def main(argv: list[str] | None = None) -> int:
     try:
         exit_code, events = supervisor.run(issue=issue)
     except HealthCheckError as e:
-        print(f"health check failed: {e}", file=sys.stderr)
+        print(f"error: health check failed: {e}", file=sys.stderr)
         return 2
     except ConcurrentRunError as e:
         print(f"error: {e}", file=sys.stderr)

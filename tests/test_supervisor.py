@@ -129,6 +129,12 @@ def test_lifecycle_events_written_in_order(tmp_path):
     exited = next(e for e in entries if e["type"] == "ralph_exited")
     assert exited["payload"]["exit_code"] == 0
 
+    # run_started payload does NOT duplicate the envelope's issue field —
+    # issue is already a top-level envelope key.
+    started = next(e for e in entries if e["type"] == "run_started")
+    assert started["issue"] == 12
+    assert "issue" not in started["payload"]
+
 
 def test_sigint_shuts_down_cleanly_and_writes_run_ended(tmp_path):
     import signal
@@ -226,7 +232,7 @@ def test_retention_prunes_old_runs_on_startup(tmp_path):
     assert "run_ended" in current_types
 
 
-def test_kill_exception_on_sigint_is_logged_as_repair_failed(tmp_path, monkeypatch):
+def test_kill_exception_on_sigint_is_logged_as_repair_failed(tmp_path):
     """If RalphClient.kill raises during SIGINT, the failure must be audit-logged
     (not silently swallowed) and the run must still exit cleanly."""
     import signal
@@ -235,29 +241,10 @@ def test_kill_exception_on_sigint_is_logged_as_repair_failed(tmp_path, monkeypat
 
     _init_repo(tmp_path)
 
-    # inject a helper that monkey-patches RalphProcess.kill to raise
-    helper = tmp_path / "run_with_broken_kill.py"
-    helper.write_text(
-        "import sys\n"
-        "from pathlib import Path\n"
-        "from smart_ralph import ralph_client\n"
-        "from smart_ralph.supervisor import Supervisor\n"
-        "\n"
-        "orig_kill = ralph_client.RalphProcess.kill\n"
-        "def broken_kill(self, issue):\n"
-        "    raise RuntimeError('git binary missing')\n"
-        "ralph_client.RalphProcess.kill = broken_kill\n"
-        "\n"
-        "s = Supervisor(\n"
-        f"    ralph_path=Path({str(FIXTURES / 'long_running.sh')!r}),\n"
-        f"    cwd=Path({str(tmp_path)!r}),\n"
-        "    required_tools=['git'],\n"
-        ")\n"
-        "sys.exit(s.run(issue=42)[0])\n"
-    )
-
+    helper = Path(__file__).parent / "_helpers" / "run_supervisor_broken_kill.py"
     proc = subprocess.Popen(
-        [sys.executable, str(helper)],
+        [sys.executable, str(helper), str(tmp_path),
+         str(FIXTURES / "long_running.sh"), "42"],
         stdout=subprocess.PIPE, stderr=subprocess.PIPE,
     )
 
