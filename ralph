@@ -1,6 +1,19 @@
 #!/usr/bin/env bash
 set -o pipefail
 
+# Structured event emission (no-op unless supervisor sets SMART_RALPH_RUN_ID).
+_ralph_root="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
+# shellcheck disable=SC1091
+source "$_ralph_root/lib/ralph-events.sh"
+
+# On any exit path, emit ralph_exit with the final exit code. Trap captures
+# $? as the first thing so it reflects the exiting command's status.
+_ralph_on_exit() {
+  local ec=$?
+  emit_event ralph_exit "" "$(jq -nc --argjson c "$ec" '{exit_code:$c}')" || true
+}
+trap _ralph_on_exit EXIT
+
 # ralph — Automated TDD issue orchestrator
 #
 # Processes GitHub issues from a PRD with dependency ordering,
@@ -81,9 +94,12 @@ get_state() {
 }
 
 set_state() {
+  local old; old=$(get_state "$1")
   local tmp; tmp=$(mktemp)
   jq --arg i "$1" --arg s "$2" '.issues[$i] = $s' "$(state_file)" > "$tmp"
   mv "$tmp" "$(state_file)"
+  emit_event ralph_state_transition "$1" \
+    "$(jq -nc --arg f "$old" --arg t "$2" '{from:$f, to:$t}')"
 }
 
 save_meta() {
@@ -154,6 +170,9 @@ run_issue() {
   local worktree="${WORKTREE_PREFIX}/issue-${issue}-${slug}"
 
   log "Running #${issue}: ${title} (mode: ${mode}, max ${max} iterations)"
+  emit_event ralph_issue_started "$issue" \
+    "$(jq -nc --arg t "$title" --arg m "$mode" --argjson n "$max" \
+        '{title:$t, mode:$m, max_iterations:$n}')"
 
   # Ensure worktree branches from latest main
   local main; main=$(default_branch)
@@ -226,6 +245,8 @@ PROMPT
 
   for ((i = 1; i <= max; i++)); do
     log "  Iteration ${i}/${max}"
+    emit_event ralph_iteration_started "$issue" \
+      "$(jq -nc --argjson i "$i" --argjson n "$max" '{iteration:$i, max:$n}')"
     local tmp; tmp=$(mktemp)
 
     if claude --dangerously-skip-permissions \
@@ -256,11 +277,22 @@ PROMPT
 
     if [[ "$result" == *"<promise>COMPLETE</promise>"* ]]; then
       ok "  Issue #${issue} complete after ${i} iteration(s)"
+      emit_event ralph_iteration_ended "$issue" \
+        "$(jq -nc --argjson i "$i" --arg o "complete" '{iteration:$i, outcome:$o}')"
       return 0
     fi
+
+    emit_event ralph_iteration_ended "$issue" \
+      "$(jq -nc --argjson i "$i" --arg o "continue" '{iteration:$i, outcome:$o}')"
   done
 
   warn "  Issue #${issue} incomplete after ${max} iterations"
+  emit_event ralph_error "$issue" \
+    "$(jq -nc --arg r "iterations_exhausted" --argjson n "$max" \
+        '{reason:$r, iterations:$n}')"
+  emit_event ralph_issue_ended "$issue" \
+    "$(jq -nc --arg o "incomplete" --argjson n "$max" \
+        '{outcome:$o, iterations:$n}')"
   return 1
 }
 
@@ -356,10 +388,14 @@ merge_issue() {
 
   if [[ -z "$pr" ]]; then
     warn "  No open PR found for #${issue}"
+    emit_event ralph_merge_failed "$issue" \
+      "$(jq -nc --arg r "no_pr_found" '{reason:$r}')"
     return 1
   fi
 
   log "  Merging PR #${pr}"
+  emit_event ralph_merge_attempted "$issue" \
+    "$(jq -nc --argjson pr "$pr" '{pr:$pr}')"
   gh pr merge "$pr" --merge --delete-branch 2>/dev/null || true
 
   # Verify the PR actually merged (don't trust exit code — branch cleanup
@@ -368,8 +404,14 @@ merge_issue() {
   pr_state=$(gh pr view "$pr" --json state -q '.state' 2>/dev/null || echo "")
   if [[ "$pr_state" != "MERGED" ]]; then
     err "  Failed to merge PR #${pr} (state: ${pr_state})"
+    emit_event ralph_merge_failed "$issue" \
+      "$(jq -nc --argjson pr "$pr" --arg s "$pr_state" \
+          '{pr:$pr, state:$s, reason:"not_merged"}')"
     return 1
   fi
+
+  emit_event ralph_merge_succeeded "$issue" \
+    "$(jq -nc --argjson pr "$pr" '{pr:$pr}')"
 
   # Sync local main so next worktree branches from updated code
   git fetch origin "$main" &>/dev/null

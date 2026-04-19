@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+# Fake claude: emits a minimal stream-json completion with COMPLETE.
+# Accepts and ignores all flags; writes to stdout so ralph's pipe sees it.
+set -euo pipefail
+printf '%s\n' '{"type":"assistant","message":{"content":[{"type":"text","text":"doing work"}]}}'
+printf '%s\n' '{"type":"result","result":"<promise>COMPLETE</promise>"}'

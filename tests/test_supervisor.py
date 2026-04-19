@@ -232,6 +232,41 @@ def test_retention_prunes_old_runs_on_startup(tmp_path):
     assert "run_ended" in current_types
 
 
+def test_supervisor_and_ralph_share_events_jsonl(tmp_path):
+    """Supervisor and the patched ralph must share .smart-ralph/events.jsonl.
+    Both sources' events must be present, each with its own `source` tag and
+    matching run_id."""
+    _init_repo(tmp_path)
+    supervisor = Supervisor(
+        ralph_path=FIXTURES / "writes_events.sh",
+        cwd=tmp_path,
+        required_tools=_all_tools_present(),
+    )
+
+    supervisor.run(issue=55)
+
+    events_path = tmp_path / ".smart-ralph" / "events.jsonl"
+    assert events_path.exists()
+    entries = [json.loads(line) for line in events_path.read_text().splitlines()]
+
+    sources = {e["source"] for e in entries}
+    assert "supervisor" in sources
+    assert "ralph" in sources
+
+    # All events must carry the same run_id (supervisor-assigned).
+    run_ids = {e["run_id"] for e in entries}
+    assert len(run_ids) == 1, (
+        f"supervisor and ralph events must share run_id, got {run_ids}"
+    )
+
+    # Ralph-source events carry issue=55 (propagated from the spawn call).
+    ralph_events = [e for e in entries if e["source"] == "ralph"]
+    assert ralph_events, "expected at least one ralph-source event"
+    ralph_types = [e["type"] for e in ralph_events]
+    assert "ralph_iteration_started" in ralph_types
+    assert "ralph_iteration_ended" in ralph_types
+
+
 def test_kill_exception_on_sigint_is_logged_as_repair_failed(tmp_path):
     """If RalphClient.kill raises during SIGINT, the failure must be audit-logged
     (not silently swallowed) and the run must still exit cleanly."""

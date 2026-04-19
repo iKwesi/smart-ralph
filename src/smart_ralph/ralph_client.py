@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import json
+import os
 import subprocess
 import time
 from pathlib import Path
@@ -13,24 +13,17 @@ class RalphProcess:
         self._cwd = cwd
 
     def events(self) -> Iterator[dict[str, Any]]:
+        """Yield ralph's human-readable stdout wrapped as ralph_stdout events.
+
+        Structured events from ralph are written directly to the shared
+        .smart-ralph/events.jsonl by ralph itself (via lib/ralph-events.sh)
+        using the run_id the supervisor injects at spawn time, so there is
+        no in-memory merge step here.
+        """
         assert self._proc.stdout is not None
         for raw in self._proc.stdout:
             line = raw.rstrip("\n")
             yield {"type": "ralph_stdout", "payload": {"line": line}}
-        yield from self._replay_ralph_events()
-
-    def _replay_ralph_events(self) -> Iterator[dict[str, Any]]:
-        path = self._cwd / ".ralph" / "events.jsonl"
-        if not path.exists():
-            return
-        for line in path.read_text().splitlines():
-            if not line.strip():
-                continue
-            try:
-                parsed = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            yield {"type": "ralph_event", "payload": parsed}
 
     def wait(self) -> int:
         return self._proc.wait()
@@ -57,11 +50,26 @@ class RalphProcess:
 
 
 class RalphClient:
-    def __init__(self, ralph_path: Path, cwd: Path) -> None:
+    def __init__(
+        self,
+        ralph_path: Path,
+        cwd: Path,
+        *,
+        run_id: str | None = None,
+        events_path: Path | None = None,
+    ) -> None:
         self._ralph_path = Path(ralph_path)
         self._cwd = Path(cwd)
+        self._run_id = run_id
+        self._events_path = Path(events_path) if events_path is not None else None
 
     def spawn(self, issue: int) -> RalphProcess:
+        env = os.environ.copy()
+        if self._run_id is not None:
+            env["SMART_RALPH_RUN_ID"] = self._run_id
+        if self._events_path is not None:
+            env["SMART_RALPH_EVENTS_PATH"] = str(self._events_path)
+
         proc = subprocess.Popen(
             [str(self._ralph_path), str(issue)],
             cwd=self._cwd,
@@ -69,5 +77,6 @@ class RalphClient:
             stderr=subprocess.STDOUT,
             text=True,
             bufsize=1,
+            env=env,
         )
         return RalphProcess(proc, self._cwd)
