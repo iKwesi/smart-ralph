@@ -179,3 +179,48 @@ def test_sigint_shuts_down_cleanly_and_writes_run_ended(tmp_path):
     ]
     assert lifecycle[0] == "run_started"
     assert lifecycle[-1] == "run_ended"
+
+
+def test_retention_prunes_old_runs_on_startup(tmp_path):
+    _init_repo(tmp_path)
+    events_path = tmp_path / ".smart-ralph" / "events.jsonl"
+    events_path.parent.mkdir()
+
+    # simulate 3 historical runs already on disk
+    lines = []
+    for rid in ["run-old-1", "run-old-2", "run-old-3"]:
+        lines.append(json.dumps({
+            "schema_version": 1, "ts": "2026-01-01T00:00:00.000Z",
+            "run_id": rid, "type": "run_started", "source": "supervisor",
+            "issue": None, "payload": {},
+        }))
+        lines.append(json.dumps({
+            "schema_version": 1, "ts": "2026-01-01T00:00:01.000Z",
+            "run_id": rid, "type": "run_ended", "source": "supervisor",
+            "issue": None, "payload": {},
+        }))
+    events_path.write_text("\n".join(lines) + "\n")
+
+    supervisor = Supervisor(
+        ralph_path=FIXTURES / "echo_stdout.sh",
+        cwd=tmp_path,
+        required_tools=_all_tools_present(),
+        retention_runs=2,
+    )
+
+    supervisor.run(prd="16")
+
+    entries = [json.loads(line) for line in events_path.read_text().splitlines()]
+    run_ids = list({e["run_id"]: None for e in entries}.keys())
+    # run-old-1 pruned; run-old-2, run-old-3, and the new run remain
+    # (prune happens on startup BEFORE the new run_id is appended, so the
+    # new run_id is in addition to whatever kept=2 retained).
+    assert "run-old-1" not in run_ids
+    assert "run-old-2" in run_ids
+    assert "run-old-3" in run_ids
+    # the new supervisor run's events are present
+    current_types = [e["type"] for e in entries if e["run_id"] not in {
+        "run-old-1", "run-old-2", "run-old-3"
+    }]
+    assert "run_started" in current_types
+    assert "run_ended" in current_types

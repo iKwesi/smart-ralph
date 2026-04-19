@@ -33,10 +33,12 @@ class Supervisor:
         ralph_path: Path,
         cwd: Path,
         required_tools: list[str],
+        retention_runs: int = 50,
     ) -> None:
         self._ralph_path = Path(ralph_path)
         self._cwd = Path(cwd)
         self._required_tools = required_tools
+        self._retention_runs = retention_runs
 
     def run(self, prd: str) -> tuple[int, list[dict]]:
         missing = [t for t in self._required_tools if shutil.which(t) is None]
@@ -64,6 +66,7 @@ class Supervisor:
 
         run_id = uuid.uuid4().hex[:16]
         log = EventLog(meta_dir / "events.jsonl", run_id=run_id)
+        log.prune_runs(keep=self._retention_runs)
         issue = _issue_from_prd(prd)
         process = None
         exit_code = 1
