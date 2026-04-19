@@ -279,6 +279,9 @@ PROMPT
       ok "  Issue #${issue} complete after ${i} iteration(s)"
       emit_event ralph_iteration_ended "$issue" \
         "$(jq -nc --argjson i "$i" --arg o "complete" '{iteration:$i, outcome:$o}')"
+      emit_event ralph_issue_ended "$issue" \
+        "$(jq -nc --arg o "complete" --argjson n "$i" \
+            '{outcome:$o, iterations:$n}')"
       return 0
     fi
 

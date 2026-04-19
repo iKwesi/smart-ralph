@@ -153,13 +153,80 @@ def test_oversized_payload_written_to_blob_sidecar(tmp_path):
     assert evt["payload"].get("oversized") is True
 
     blob_rel = evt["payload"]["blob_ref"]
-    blob_path = tmp_path / blob_rel
+    # blob_ref is relative to events_root (the events.jsonl parent), so
+    # readers can resolve it without needing to know ralph's cwd.
+    events_root = (tmp_path / ".smart-ralph").resolve()
+    blob_path = events_root / blob_rel
     assert blob_path.exists(), f"blob not at {blob_path}"
-    # The blob path should live under .smart-ralph/blobs/<run_id>/
-    assert ".smart-ralph/blobs/run-test-1/" in blob_rel
+    assert blob_rel.startswith("blobs/run-test-1/"), blob_rel
     # Full original payload recoverable from the blob.
     recovered = json.loads(blob_path.read_text())
     assert recovered == {"log": big_text}
+
+
+def test_multibyte_payload_offloaded_when_bytes_exceed_4kb(tmp_path):
+    """Char count can understate size for multi-byte UTF-8 content.
+    The guard must count bytes so the atomicity window is never exceeded."""
+    # 1500 em-dashes = 1500 chars, 4500 UTF-8 bytes (3 per char).
+    # Well under 4096 chars, well over 4096 bytes.
+    payload_json = json.dumps({"log": "\u2014" * 1500}, ensure_ascii=False)
+    assert len(payload_json) < 4000  # char count below threshold
+    assert len(payload_json.encode("utf-8")) > 4096  # byte count above
+
+    result = _emit(
+        tmp_path,
+        "ralph_error",
+        "9",
+        payload_json,
+    )
+    assert result.returncode == 0, result.stderr
+
+    events_path = tmp_path / ".smart-ralph" / "events.jsonl"
+    line = events_path.read_text().splitlines()[0]
+
+    # The emitted envelope must fit in the atomicity window by BYTES.
+    assert len(line.encode("utf-8")) + 1 <= 4096, (
+        f"envelope line is {len(line.encode('utf-8')) + 1} bytes"
+    )
+
+    evt = json.loads(line)
+    assert "blob_ref" in evt["payload"]
+    assert evt["payload"].get("oversized") is True
+
+
+def test_non_integer_issue_coerced_to_null(tmp_path):
+    """Guard against malformed issue values reaching jq --argjson —
+    they must be coerced to null, not parsed as raw JSON."""
+    result = _emit(
+        tmp_path,
+        "ralph_issue_started",
+        "not-a-number",
+        "{}",
+    )
+    assert result.returncode == 0, result.stderr
+
+    events_path = tmp_path / ".smart-ralph" / "events.jsonl"
+    evt = json.loads(events_path.read_text().splitlines()[0])
+    assert evt["issue"] is None
+
+
+def test_missing_payload_defaults_to_empty_object(tmp_path):
+    """emit_event called with no payload argument must default to {}."""
+    events_path = tmp_path / ".smart-ralph" / "events.jsonl"
+    env = {
+        "PATH": os.environ["PATH"],
+        "SMART_RALPH_RUN_ID": "run-default",
+        "SMART_RALPH_EVENTS_PATH": str(events_path),
+    }
+    script = f"source {LIB} && emit_event ralph_issue_started 7"
+    result = subprocess.run(
+        ["bash", "-c", script],
+        env=env, cwd=tmp_path, capture_output=True, text=True, check=False,
+    )
+    assert result.returncode == 0, result.stderr
+
+    evt = json.loads(events_path.read_text().splitlines()[0])
+    assert evt["payload"] == {}
 
 
 # ── Slice 5: ralph emits issue + iteration + exit ─────────
@@ -189,7 +256,14 @@ def test_ralph_run_emits_issue_iteration_and_exit_events(tmp_path):
     assert "ralph_issue_started" in types
     assert "ralph_iteration_started" in types
     assert "ralph_iteration_ended" in types
+    assert "ralph_issue_ended" in types
     assert "ralph_exit" in types
+
+    # Success path must close the issue with outcome=complete (symmetric
+    # with the iterations-exhausted path).
+    issue_ended = next(e for e in events if e["type"] == "ralph_issue_ended")
+    assert issue_ended["payload"]["outcome"] == "complete"
+    assert issue_ended["payload"]["iterations"] == 1
 
     # Every ralph-emitted event has source: "ralph" and matching run_id.
     for evt in events:
@@ -310,6 +384,12 @@ def test_ralph_run_emits_ralph_error_on_iteration_exhaustion(tmp_path):
     assert err_evt["source"] == "ralph"
     assert err_evt["issue"] == 9
     assert "iterations_exhausted" in err_evt["payload"].get("reason", "")
+
+    # ralph_exit must carry the non-zero exit code so supervisor readers
+    # can distinguish failure from success without re-deriving it.
+    exit_events = [e for e in events if e["type"] == "ralph_exit"]
+    assert len(exit_events) == 1
+    assert exit_events[0]["payload"]["exit_code"] != 0
 
 
 # ── Slice 7: merge events ─────────────────────────────────

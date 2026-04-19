@@ -14,26 +14,57 @@
 # Envelope schema version — must match src/smart_ralph/eventlog.py.
 RALPH_EVENTS_SCHEMA_VERSION=1
 
-# emit_event <type> <issue|""> <payload_json>
+# _ralph_ts — emit ISO 8601 UTC timestamp.
+#
+# Prefers GNU date / gdate for millisecond precision; falls back to bash's
+# printf '%(...)T' builtin (no fork) on platforms without %N-aware date.
+# The backend is probed once and memoized in _RALPH_TS_IMPL.
+_ralph_ts() {
+  if [[ -z "${_RALPH_TS_IMPL:-}" ]]; then
+    if command -v gdate >/dev/null 2>&1; then
+      _RALPH_TS_IMPL="gdate"
+    elif [[ "$(date -u +%N 2>/dev/null)" =~ ^[0-9]{9}$ ]]; then
+      _RALPH_TS_IMPL="gnu-date"
+    else
+      _RALPH_TS_IMPL="bash-builtin"
+    fi
+    export _RALPH_TS_IMPL
+  fi
+  case "$_RALPH_TS_IMPL" in
+    gdate)        gdate -u +"%Y-%m-%dT%H:%M:%S.%3NZ" ;;
+    gnu-date)     date -u +"%Y-%m-%dT%H:%M:%S.%3NZ" ;;
+    bash-builtin) printf '%(%Y-%m-%dT%H:%M:%S.000Z)T' -1 ;;
+  esac
+}
+
+# _ralph_byte_len — byte count of stdin, locale-independent.
+_ralph_byte_len() {
+  wc -c
+}
+
+# emit_event <type> <issue|""> [<payload_json>]
 #
 # Writes one envelope JSON line via O_APPEND (shell `>>` is POSIX O_APPEND,
-# atomic for writes ≤ PIPE_BUF ≈ 4KB). issue may be empty or "null" for
-# nullable; otherwise pass a bare integer.
+# atomic for writes ≤ PIPE_BUF ≈ 4KB). issue may be empty, "null", or any
+# non-integer (all coerced to null); otherwise pass a bare integer. payload
+# defaults to an empty object when omitted.
 emit_event() {
   [[ -z "${SMART_RALPH_RUN_ID:-}" ]] && return 0
 
   local type="$1"
   local issue="${2:-}"
-  local payload_json="${3:-{\}}"
+  local payload_json="${3:-}"
+  [[ -z "$payload_json" ]] && payload_json="{}"
 
   local events_path="${SMART_RALPH_EVENTS_PATH:-.smart-ralph/events.jsonl}"
 
-  # ts in ISO 8601 UTC with millisecond precision.
   local ts
-  ts=$(python3 -c "from datetime import datetime, timezone; n = datetime.now(timezone.utc); print(n.strftime('%Y-%m-%dT%H:%M:%S.') + f'{n.microsecond // 1000:03d}Z')")
+  ts=$(_ralph_ts)
 
+  # Coerce anything that isn't a plain integer (or "null"/empty) to null so
+  # jq --argjson never ingests unvalidated strings as raw JSON.
   local issue_arg
-  if [[ -z "$issue" || "$issue" == "null" ]]; then
+  if [[ -z "$issue" || "$issue" == "null" || ! "$issue" =~ ^-?[0-9]+$ ]]; then
     issue_arg="null"
   else
     issue_arg="$issue"
@@ -49,20 +80,23 @@ emit_event() {
     --argjson payload "$payload_json" \
     '{schema_version:$sv, ts:$ts, run_id:$rid, type:$type, source:"ralph", issue:$issue, payload:$payload}')
 
-  # POSIX atomic-append guarantee is ≤ PIPE_BUF (~4KB including newline).
-  # Oversized payloads are offloaded to a sidecar blob; the line keeps only
-  # a reference so concurrent writers never interleave partial data.
-  if (( ${#line} + 1 > 4096 )); then
-    local events_root blob_dir blob_rel blob_path
+  # Byte-accurate size check: UTF-8 multi-byte chars can push a line past
+  # PIPE_BUF even when char count is under the limit. ${#line} is chars;
+  # wc -c is bytes.
+  local line_bytes
+  line_bytes=$(printf '%s\n' "$line" | _ralph_byte_len)
+  if (( line_bytes > 4096 )); then
+    local events_root blob_dir blob_rel blob_path blob_name
     events_root=$(dirname "$events_path")
     blob_dir="$events_root/blobs/$SMART_RALPH_RUN_ID"
     mkdir -p "$blob_dir"
-    local blob_name="$(date -u +%s%N)-$$.json"
+    blob_name="$(date -u +%s%N 2>/dev/null || date -u +%s)-$$.json"
     blob_path="$blob_dir/$blob_name"
     printf '%s' "$payload_json" > "$blob_path"
 
-    # blob_ref is relative to the cwd so supervisor can resolve it.
-    blob_rel="${blob_path#$PWD/}"
+    # blob_ref is relative to events_root so readers can resolve it
+    # regardless of the process cwd at read time.
+    blob_rel="${blob_path#${events_root}/}"
     line=$(jq -nc \
       --argjson sv "$RALPH_EVENTS_SCHEMA_VERSION" \
       --arg ts "$ts" \
