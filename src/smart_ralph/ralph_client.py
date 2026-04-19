@@ -35,6 +35,10 @@ class RalphProcess:
     def wait(self) -> int:
         return self._proc.wait()
 
+    @property
+    def pid(self) -> int:
+        return self._proc.pid
+
     def kill(self, issue: int) -> None:
         stash_name = f"smart-ralph-issue-{issue}-{int(time.time())}"
         subprocess.run(
