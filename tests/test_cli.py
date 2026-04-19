@@ -79,7 +79,11 @@ def test_cli_rejects_non_numeric_prd(tmp_path):
     )
 
     assert result.returncode == 2, result.stderr
-    assert "issue" in result.stderr.lower() or "integer" in result.stderr.lower()
+    err = result.stderr.lower()
+    assert "issue number" in err and "positive integer" in err
+    # user-facing text speaks "issue number", never the internal "PRD" jargon
+    assert "prd" not in err
+    assert err.startswith("error:"), result.stderr
     # no run.lock, no events.jsonl — aborted before any state was created
     assert not (tmp_path / ".smart-ralph" / "run.lock").exists()
     assert not (tmp_path / ".smart-ralph" / "events.jsonl").exists()
@@ -103,3 +107,32 @@ def test_cli_rejects_zero_or_negative_prd(tmp_path):
             timeout=10,
         )
         assert result.returncode == 2, f"{bad}: {result.stderr}"
+        err = result.stderr.lower()
+        assert "issue number" in err and "positive integer" in err, f"{bad}: {result.stderr}"
+        assert "prd" not in err, f"{bad}: {result.stderr}"
+        assert err.startswith("error:"), f"{bad}: {result.stderr}"
+
+
+def test_cli_health_check_failure_uses_error_prefix(tmp_path):
+    """Every CLI-surfaced error message starts with `error: `. Health check
+    shouldn't be the outlier."""
+    _init_repo(tmp_path)
+    env = os.environ.copy()
+    env["SMART_RALPH_RALPH_PATH"] = str(FIXTURES / "echo_stdout.sh")
+    env["SMART_RALPH_REQUIRED_TOOLS"] = "git,definitely-not-a-real-tool-qqq"
+    venv_bin = REPO / ".venv" / "bin"
+    env["PATH"] = f"{venv_bin}{os.pathsep}{env.get('PATH', '')}"
+
+    result = subprocess.run(
+        [str(SMART_RALPH), "11"],
+        cwd=tmp_path,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+
+    assert result.returncode == 2, result.stderr
+    err = result.stderr.lower()
+    assert err.startswith("error:"), result.stderr
+    assert "definitely-not-a-real-tool-qqq" in err

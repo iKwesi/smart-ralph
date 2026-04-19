@@ -78,7 +78,7 @@ class Supervisor:
         try:
             log.append(
                 event_type="run_started", source="supervisor",
-                issue=issue, payload={"issue": issue}, sync=True,
+                issue=issue, payload={}, sync=True,
             )
             client = RalphClient(ralph_path=self._ralph_path, cwd=self._cwd)
             process = client.spawn(issue=issue)
