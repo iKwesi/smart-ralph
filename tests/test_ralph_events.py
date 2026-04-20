@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 from pathlib import Path
 
@@ -163,7 +164,6 @@ def test_oversized_payload_written_to_blob_sidecar(tmp_path):
     # Filename must be shell/filesystem-safe on every platform — BSD `date`
     # silently outputs the literal string "%N" when asked for nanoseconds,
     # which would leak a "%" character into the blob path.
-    import re
     blob_basename = blob_path.name
     assert re.fullmatch(r"[A-Za-z0-9._-]+", blob_basename), (
         f"unsafe blob filename: {blob_basename!r}"
@@ -200,6 +200,7 @@ def test_blob_filename_is_safe_under_bsd_date(tmp_path):
     events_path = tmp_path / ".smart-ralph" / "events.jsonl"
     env = {
         "PATH": f"{shim_dir}:/usr/bin:/bin",  # shim first, no gdate available
+        "LC_ALL": "C",  # keep jq/wc/bash behavior deterministic under the shim
         "SMART_RALPH_RUN_ID": "run-bsd",
         "SMART_RALPH_EVENTS_PATH": str(events_path),
     }
