@@ -1,0 +1,79 @@
+#!/usr/bin/env bash
+# Fake gh: enough surface area for ralph's run/merge paths.
+# Env knobs:
+#   FAKE_GH_PR_NUMBER (default 99)    — number returned by `pr list`
+#   FAKE_GH_PR_STATE  (default MERGED) — state returned by `pr view`
+set -euo pipefail
+
+if [[ -n "${FAKE_GH_PR_NONE:-}" ]]; then
+  pr_num=""
+else
+  pr_num="${FAKE_GH_PR_NUMBER:-99}"
+fi
+pr_state="${FAKE_GH_PR_STATE:-MERGED}"
+
+sub="${1:-}"; shift || true
+action="${1:-}"; shift || true
+
+case "$sub" in
+  issue)
+    case "$action" in
+      view)
+        # Extract -q flag if present; ignore everything else.
+        while [[ $# -gt 0 ]]; do
+          case "$1" in
+            -q) shift; jq_filter="$1"; shift ;;
+            --jq) shift; jq_filter="$1"; shift ;;
+            *) shift ;;
+          esac
+        done
+        if [[ "${jq_filter:-}" == ".title" ]]; then
+          echo "Fake issue for tests"
+        else
+          echo '{"title":"Fake issue for tests"}'
+        fi
+        ;;
+      list)
+        echo '[]'
+        ;;
+      close)
+        : # silent success
+        ;;
+      *)
+        echo '{}'
+        ;;
+    esac
+    ;;
+  pr)
+    case "$action" in
+      list)
+        # ralph passes a complex -q filter that ultimately returns the PR number
+        # or empty. We short-circuit to $pr_num.
+        echo "$pr_num"
+        ;;
+      view)
+        while [[ $# -gt 0 ]]; do
+          case "$1" in
+            -q) shift; jq_filter="$1"; shift ;;
+            *) shift ;;
+          esac
+        done
+        if [[ "${jq_filter:-}" == ".state" ]]; then
+          echo "$pr_state"
+        else
+          echo "{\"state\":\"$pr_state\"}"
+        fi
+        ;;
+      merge|diff|comment)
+        : # silent success
+        ;;
+      *)
+        : ;;
+    esac
+    ;;
+  api)
+    echo '{}'
+    ;;
+  *)
+    : ;;
+esac

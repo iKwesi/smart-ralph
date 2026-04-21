@@ -80,7 +80,12 @@ class Supervisor:
                 event_type="run_started", source="supervisor",
                 issue=issue, payload={}, sync=True,
             )
-            client = RalphClient(ralph_path=self._ralph_path, cwd=self._cwd)
+            client = RalphClient(
+                ralph_path=self._ralph_path,
+                cwd=self._cwd,
+                run_id=run_id,
+                events_path=meta_dir / "events.jsonl",
+            )
             process = client.spawn(issue=issue)
             log.append(
                 event_type="ralph_spawned", source="supervisor",

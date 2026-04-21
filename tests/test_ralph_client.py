@@ -18,6 +18,26 @@ def _init_repo(path: Path) -> None:
     )
 
 
+def test_spawn_injects_smart_ralph_env_vars(tmp_path):
+    events_path = tmp_path / ".smart-ralph" / "events.jsonl"
+    client = RalphClient(
+        ralph_path=FIXTURES / "echo_env.sh",
+        cwd=tmp_path,
+        run_id="run-xyz",
+        events_path=events_path,
+    )
+
+    process = client.spawn(issue=2)
+    events = list(process.events())
+    process.wait()
+
+    stdout_lines = [
+        e["payload"]["line"] for e in events if e["type"] == "ralph_stdout"
+    ]
+    assert f"SMART_RALPH_RUN_ID=run-xyz" in stdout_lines
+    assert f"SMART_RALPH_EVENTS_PATH={events_path}" in stdout_lines
+
+
 def test_spawn_yields_stdout_lines_as_events(tmp_path):
     client = RalphClient(
         ralph_path=FIXTURES / "echo_stdout.sh",
@@ -38,33 +58,44 @@ def test_spawn_yields_stdout_lines_as_events(tmp_path):
     ]
 
 
-def test_events_merges_ralph_events_jsonl(tmp_path):
+def test_ralph_structured_events_land_in_shared_events_jsonl(tmp_path):
+    """Post-#6: ralph writes structured events directly to the shared
+    .smart-ralph/events.jsonl using supervisor-injected env vars. Stdout is
+    still surfaced in-memory as ralph_stdout; structured events are not
+    duplicated into the in-memory stream."""
+    events_path = tmp_path / ".smart-ralph" / "events.jsonl"
     client = RalphClient(
         ralph_path=FIXTURES / "writes_events.sh",
         cwd=tmp_path,
+        run_id="run-shared",
+        events_path=events_path,
     )
 
     process = client.spawn(issue=7)
     events = list(process.events())
     process.wait()
 
-    # stdout events present
+    # stdout still surfaces in-memory
     stdout_lines = [
         e["payload"]["line"] for e in events if e["type"] == "ralph_stdout"
     ]
     assert stdout_lines == ["ralph: iteration begin", "ralph: working", "ralph: done"]
 
-    # ralph's own structured events are merged in as ralph_event
-    ralph_events = [e for e in events if e["type"] == "ralph_event"]
-    types = [e["payload"]["type"] for e in ralph_events]
-    assert types == ["ralph_iteration_started", "ralph_iteration_ended"]
-    assert ralph_events[0]["payload"]["payload"]["prd"] == "7"  # stub passes the raw arg
-    assert ralph_events[1]["payload"]["payload"]["ok"] is True
+    # Structured events are NOT duplicated into the in-memory stream.
+    assert not [e for e in events if e["type"].startswith("ralph_iteration")]
 
-    # sanity: .ralph/events.jsonl actually got written
-    written = (tmp_path / ".ralph" / "events.jsonl").read_text().splitlines()
-    assert len(written) == 2
-    assert json.loads(written[0])["type"] == "ralph_iteration_started"
+    # They are written directly to the shared events.jsonl with envelope shape.
+    entries = [
+        json.loads(line)
+        for line in events_path.read_text().splitlines() if line.strip()
+    ]
+    types = [e["type"] for e in entries]
+    assert types == ["ralph_iteration_started", "ralph_iteration_ended"]
+    for entry in entries:
+        assert entry["source"] == "ralph"
+        assert entry["run_id"] == "run-shared"
+        assert entry["issue"] == 7
+        assert entry["schema_version"] == 1
 
 
 def test_kill_terminates_process_and_stashes_uncommitted(tmp_path):

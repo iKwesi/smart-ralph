@@ -1,11 +1,19 @@
 #!/usr/bin/env bash
-# Fake ralph that writes structured events to .ralph/events.jsonl
-# *while* also writing stdout lines. Mimics the real patched ralph.
+# Fake ralph that emits envelope-formatted structured events via the
+# real lib/ralph-events.sh helper, while also writing stdout. This is the
+# post-#6 shape: ralph writes DIRECTLY to .smart-ralph/events.jsonl
+# (using env vars the supervisor injects), not to a separate .ralph file.
 set -euo pipefail
-prd="${1:-?}"
-mkdir -p .ralph
+issue="${1:-?}"
+
+root="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")/../../.." && pwd)"
+# shellcheck disable=SC1091
+source "$root/lib/ralph-events.sh"
+
 echo "ralph: iteration begin"
-printf '{"type":"ralph_iteration_started","payload":{"prd":"%s"}}\n' "$prd" >> .ralph/events.jsonl
+emit_event ralph_iteration_started "$issue" \
+  "$(jq -nc --argjson i 1 '{iteration:$i}')"
 echo "ralph: working"
-printf '{"type":"ralph_iteration_ended","payload":{"ok":true}}\n' >> .ralph/events.jsonl
+emit_event ralph_iteration_ended "$issue" \
+  "$(jq -nc --argjson i 1 --arg o "complete" '{iteration:$i, outcome:$o}')"
 echo "ralph: done"
