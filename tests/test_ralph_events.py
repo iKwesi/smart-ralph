@@ -8,6 +8,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
 import subprocess
 from pathlib import Path
 
@@ -96,7 +97,8 @@ def test_helper_is_safe_to_source_twice(tmp_path):
         "SMART_RALPH_RUN_ID": "run-double",
         "SMART_RALPH_EVENTS_PATH": str(events_path),
     }
-    script = f"source {LIB} && source {LIB} && emit_event ralph_ping 1 '{{}}'"
+    # No payload arg — helper defaults to an empty object.
+    script = f"source {LIB} && source {LIB} && emit_event ralph_ping 1"
     result = subprocess.run(
         ["bash", "-c", script],
         env=env, cwd=tmp_path, capture_output=True, text=True, check=False,
@@ -219,6 +221,9 @@ def test_blob_filename_is_safe_under_bsd_date(tmp_path):
     shim.chmod(0o755)
 
     # Force bash-builtin timestamp path (no gdate, no GNU date detection).
+    # Resolve bash from the parent env first — the helper requires 4.2+
+    # (preflighted by ralph) and macOS ships /bin/bash 3.2.
+    bash_bin = shutil.which("bash") or "/bin/bash"
     payload_json = json.dumps({"log": "x" * 5000})
     events_path = tmp_path / ".smart-ralph" / "events.jsonl"
     env = {
@@ -229,7 +234,7 @@ def test_blob_filename_is_safe_under_bsd_date(tmp_path):
     }
     script = f"source {LIB} && emit_event ralph_error 9 {payload_json!r}"
     result = subprocess.run(
-        ["bash", "-c", script],
+        [bash_bin, "-c", script],
         env=env, cwd=tmp_path, capture_output=True, text=True, check=False,
     )
     assert result.returncode == 0, result.stderr

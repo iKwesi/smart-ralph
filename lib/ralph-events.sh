@@ -14,15 +14,15 @@
 # Envelope schema version — must match src/smart_ralph/eventlog.py.
 # Guarded so re-sourcing the helper (e.g., from a wrapper that also sources
 # ralph) is a silent no-op instead of a "readonly variable" error.
-[[ -z "${RALPH_EVENTS_SCHEMA_VERSION:-}" ]] && readonly RALPH_EVENTS_SCHEMA_VERSION=1
+[[ -v RALPH_EVENTS_SCHEMA_VERSION ]] || readonly RALPH_EVENTS_SCHEMA_VERSION=1
 
 # Char-count threshold above which we fall through to a byte-accurate
 # check. UTF-8 is at most 4 bytes/char, so any line with ≤1022 chars
 # (this threshold minus the trailing newline) is guaranteed ≤ 4089 bytes,
 # safely under the 4096-byte PIPE_BUF window. At 1023+ chars we fall
 # through to an exact wc -c check.
-[[ -z "${RALPH_EVENTS_BYTE_CHECK_CHAR_THRESHOLD:-}" ]] && \
-  readonly RALPH_EVENTS_BYTE_CHECK_CHAR_THRESHOLD=1023
+[[ -v RALPH_EVENTS_BYTE_CHECK_CHAR_THRESHOLD ]] \
+  || readonly RALPH_EVENTS_BYTE_CHECK_CHAR_THRESHOLD=1023
 
 # _ralph_ts — emit ISO 8601 UTC timestamp.
 #
