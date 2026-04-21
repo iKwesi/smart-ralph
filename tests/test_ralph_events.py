@@ -85,6 +85,29 @@ def _emit(
 
 # ── Slice 1: envelope shape ────────────────────────────────
 
+def test_helper_is_safe_to_source_twice(tmp_path):
+    """The helper advertises itself as sourceable. Wrappers that source
+    it more than once (e.g., a shell that sources ralph and then the
+    helper directly) must not hit 'readonly variable' errors on the
+    second source."""
+    events_path = tmp_path / ".smart-ralph" / "events.jsonl"
+    env = {
+        "PATH": os.environ["PATH"],
+        "SMART_RALPH_RUN_ID": "run-double",
+        "SMART_RALPH_EVENTS_PATH": str(events_path),
+    }
+    script = f"source {LIB} && source {LIB} && emit_event ralph_ping 1 '{{}}'"
+    result = subprocess.run(
+        ["bash", "-c", script],
+        env=env, cwd=tmp_path, capture_output=True, text=True, check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    # No 'readonly variable' complaint on stderr.
+    assert "readonly" not in result.stderr.lower(), result.stderr
+    # Emit still works after double-source.
+    assert events_path.read_text().strip().startswith("{")
+
+
 def test_emit_event_writes_envelope_with_ralph_source(tmp_path):
     result = _emit(
         tmp_path,
