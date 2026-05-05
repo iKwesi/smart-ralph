@@ -67,9 +67,11 @@ class EventLog:
         blob_dir.mkdir(parents=True, exist_ok=True)
         blob_name = f"{uuid.uuid4().hex}.json"
         blob_path = blob_dir / blob_name
-        # Atomic write: stage to a sibling .tmp file, fsync, then rename.
-        # Prevents readers from seeing a truncated blob if we crash between
-        # opening the file and finishing the write.
+        # Atomic visibility: stage to a sibling .tmp file, then rename.
+        # The rename only succeeds after the write completes, so readers
+        # never observe a partially-written blob. (Power-loss durability
+        # would additionally require fsync of the file and parent dir;
+        # not in scope for v1.)
         tmp_path = blob_path.with_suffix(blob_path.suffix + ".tmp")
         tmp_path.write_text(json.dumps(payload, separators=(",", ":")))
         os.replace(tmp_path, blob_path)

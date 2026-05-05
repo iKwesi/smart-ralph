@@ -49,7 +49,9 @@ class Dashboard:
             top_lines.append(f"[bold red]ANOMALY:[/bold red] {rule}")
         top_body = "\n".join(top_lines)
         bottom_body = "\n".join(state["stdout_tail"]) or "(no output yet)"
-        # Panel needs room for the content rows + 2 border rows + 1 padding row.
+        # +2 for the panel's top/bottom borders, +1 empirical buffer for
+        # the trailing whitespace Rich emits when the panel is shorter than
+        # the layout slot.
         top_size = len(top_lines) + 3
         layout = Layout()
         layout.split_column(

@@ -4,6 +4,7 @@ import os
 import shutil
 import uuid
 from pathlib import Path
+from typing import Callable
 
 from smart_ralph.anomaly import Anomaly, AnomalyDetector
 from smart_ralph.eventlog import EventLog
@@ -35,11 +36,18 @@ class Supervisor:
         cwd: Path,
         required_tools: list[str],
         retention_runs: int = 50,
+        *,
+        detector: AnomalyDetector | None = None,
     ) -> None:
         self._ralph_path = Path(ralph_path)
         self._cwd = Path(cwd)
         self._required_tools = required_tools
         self._retention_runs = retention_runs
+        # Optional dependency injection for tests; default constructs the
+        # standard detector with the v1 built-in rule set.
+        self._detector_factory: Callable[[], AnomalyDetector] = (
+            (lambda: detector) if detector is not None else AnomalyDetector
+        )
 
     def run(self, issue: int) -> tuple[int, list[dict]]:
         if not isinstance(issue, int) or issue <= 0:
@@ -72,7 +80,7 @@ class Supervisor:
         run_id = uuid.uuid4().hex[:16]
         log = EventLog(meta_dir / "events.jsonl", run_id=run_id)
         log.prune_runs(keep=self._retention_runs)
-        detector = AnomalyDetector()
+        detector = self._detector_factory()
         process = None
         exit_code = 1
         events: list[dict] = []
