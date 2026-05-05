@@ -226,6 +226,25 @@ def test_router_default_skill_path_runs_version_check_against_canonical(monkeypa
     assert "SKILL.md" in msg
 
 
+def test_router_default_skill_path_raises_when_canonical_missing(monkeypatch, tmp_path):
+    """The whole point of making the version check the default is that it
+    can't be silently bypassed. If the canonical SKILL.md cannot be
+    located (e.g., non-standard install layout, future shiv-bundled
+    distribution per #28), construction must raise — never fall through
+    to a no-op."""
+    monkeypatch.setattr(
+        "smart_ralph.router._DEFAULT_SKILL_PATH",
+        tmp_path / "definitely-not-here" / "SKILL.md",
+    )
+
+    with pytest.raises(SkillVersionError) as exc:
+        DiagnosticRouter(provider=FakeProvider([]))
+
+    msg = str(exc.value).lower()
+    assert "skill.md" in msg
+    assert "skip_skill_check" in msg or "not found" in msg or "missing" in msg
+
+
 # ── Parser robustness: arrays and multi-block ──────────────
 
 def test_parser_returns_needs_human_when_diagnosis_body_is_json_array():

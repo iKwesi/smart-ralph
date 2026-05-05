@@ -69,16 +69,16 @@ _DEFAULT_SKILL_PATH = (
 # Sentinels for skill_path policy. Distinct typed classes (rather than
 # bare object() instances) keep the constructor's type hint exhaustive
 # under strict type checkers.
-class _UseDefault:
+class UseDefault:
     """Sentinel: use the canonical project SKILL.md."""
 
 
-class _SkipSkillCheck:
-    """Sentinel: skip the version check entirely (test harnesses)."""
+class SkipSkillCheck:
+    """Sentinel: caller opts out of the version check."""
 
 
-_USE_DEFAULT_SKILL_PATH = _UseDefault()
-SKIP_SKILL_CHECK = _SkipSkillCheck()
+_USE_DEFAULT_SKILL_PATH = UseDefault()
+SKIP_SKILL_CHECK = SkipSkillCheck()
 
 
 class SkillVersionError(RuntimeError):
@@ -123,18 +123,28 @@ class DiagnosticRouter:
         provider: Provider,
         *,
         event_log: EventLog | None = None,
-        skill_path: Path | _UseDefault | _SkipSkillCheck = _USE_DEFAULT_SKILL_PATH,
+        skill_path: Path | UseDefault | SkipSkillCheck = _USE_DEFAULT_SKILL_PATH,
     ) -> None:
         # Resolve skill_path policy:
-        #   _UseDefault       → canonical project SKILL.md (version-check ON)
-        #   _SkipSkillCheck   → caller explicitly opts out (test harness)
+        #   UseDefault       → canonical project SKILL.md (version-check ON)
+        #   SkipSkillCheck   → caller explicitly opts out
         #   Path              → caller supplies a specific file
         # Forces the version check to be the default; callers must opt
         # out via SKIP_SKILL_CHECK rather than by silently omitting it.
+        # If the canonical file cannot be located when the default was
+        # requested, raise loudly — the version check must never be
+        # silently bypassed (#28 tracks fixing path discovery for
+        # bundled-distribution layouts).
         resolved: Path | None
-        if isinstance(skill_path, _UseDefault):
-            resolved = _DEFAULT_SKILL_PATH if _DEFAULT_SKILL_PATH.exists() else None
-        elif isinstance(skill_path, _SkipSkillCheck):
+        if isinstance(skill_path, UseDefault):
+            if not _DEFAULT_SKILL_PATH.exists():
+                raise SkillVersionError(
+                    f"canonical SKILL.md not found at {_DEFAULT_SKILL_PATH}; "
+                    f"pass skill_path=<Path> explicitly, or "
+                    f"skill_path=SKIP_SKILL_CHECK to opt out of the check"
+                )
+            resolved = _DEFAULT_SKILL_PATH
+        elif isinstance(skill_path, SkipSkillCheck):
             resolved = None
         else:
             resolved = skill_path
