@@ -5,6 +5,7 @@ import shutil
 import uuid
 from pathlib import Path
 
+from smart_ralph.anomaly import Anomaly, AnomalyDetector
 from smart_ralph.eventlog import EventLog
 from smart_ralph.ralph_client import RalphClient
 
@@ -71,9 +72,19 @@ class Supervisor:
         run_id = uuid.uuid4().hex[:16]
         log = EventLog(meta_dir / "events.jsonl", run_id=run_id)
         log.prune_runs(keep=self._retention_runs)
+        detector = AnomalyDetector()
         process = None
         exit_code = 1
         events: list[dict] = []
+
+        def _record_anomalies(anomalies: list[Anomaly]) -> None:
+            for a in anomalies:
+                log.append(
+                    event_type="anomaly_detected", source="supervisor",
+                    issue=a.issue,
+                    payload={"rule": a.rule, "evidence": a.evidence},
+                    sync=True,
+                )
 
         try:
             log.append(
@@ -91,12 +102,21 @@ class Supervisor:
                 event_type="ralph_spawned", source="supervisor",
                 issue=issue, payload={"pid": process.pid}, sync=True,
             )
-            events = list(process.events())
+            events = []
+            for evt in process.events():
+                events.append(evt)
+                detector.observe(evt)
             exit_code = process.wait()
+            ralph_exited_event = {
+                "type": "ralph_exited",
+                "issue": issue,
+                "payload": {"exit_code": exit_code},
+            }
             log.append(
                 event_type="ralph_exited", source="supervisor",
                 issue=issue, payload={"exit_code": exit_code}, sync=True,
             )
+            _record_anomalies(detector.observe(ralph_exited_event))
             return exit_code, events
         except KeyboardInterrupt:
             if process is not None:

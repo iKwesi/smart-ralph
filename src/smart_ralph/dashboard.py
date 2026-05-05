@@ -39,15 +39,21 @@ class Dashboard:
     def _render_attached(self, events: list[dict[str, Any]]) -> None:
         state = _derive_state(events)
         console = Console(file=self._stream, force_terminal=True, width=80)
-        top_body = (
-            f"Issue: {state['issue']}\n"
-            f"Status: {state['status']}\n"
-            f"Ralph PID: {state['pid']}"
-        )
+        top_lines = [
+            f"Issue: {state['issue']}",
+            f"Status: {state['status']}",
+            f"Ralph PID: {state['pid']}",
+        ]
+        if state["anomaly"] is not None:
+            rule = state["anomaly"]["rule"]
+            top_lines.append(f"[bold red]ANOMALY:[/bold red] {rule}")
+        top_body = "\n".join(top_lines)
         bottom_body = "\n".join(state["stdout_tail"]) or "(no output yet)"
+        # Make room for the optional anomaly row.
+        top_size = 7 if state["anomaly"] is not None else 6
         layout = Layout()
         layout.split_column(
-            Layout(Panel(top_body, title="Progress"), size=6),
+            Layout(Panel(top_body, title="Progress"), size=top_size),
             Layout(Panel(bottom_body, title="Ralph output")),
         )
         console.print(layout)
@@ -69,6 +75,7 @@ def _derive_state(events: list[dict[str, Any]]) -> dict[str, Any]:
     pid: Any = None
     status = "pending"
     stdout_tail: list[str] = []
+    anomaly: dict[str, Any] | None = None
     for evt in events:
         etype = evt.get("type")
         payload = evt.get("payload", {})
@@ -85,9 +92,14 @@ def _derive_state(events: list[dict[str, Any]]) -> dict[str, Any]:
         elif etype == "ralph_stdout":
             line = payload.get("line", "")
             stdout_tail.append(line)
+        elif etype == "anomaly_detected":
+            # Latest anomaly wins — operator only needs to see the most
+            # recent one in the status line.
+            anomaly = {"rule": payload.get("rule", "?")}
     return {
         "issue": issue if issue is not None else "?",
         "pid": pid if pid is not None else "?",
         "status": status,
         "stdout_tail": stdout_tail[-10:],
+        "anomaly": anomaly,
     }

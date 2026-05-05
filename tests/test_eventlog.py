@@ -67,3 +67,45 @@ def test_prune_runs_keeps_only_last_n_runs(tmp_path):
 
 def test_prune_runs_on_missing_file_is_noop(tmp_path):
     EventLog(tmp_path / "events.jsonl", run_id="run-1").prune_runs(keep=50)
+
+
+# ── Oversized payload offload (issue #7 — anomaly evidence may be huge) ──
+
+def test_oversized_payload_offloaded_to_blob_sidecar(tmp_path):
+    """Match the ralph-events.sh contract on the supervisor side: any line
+    that would exceed the 4KB PIPE_BUF window writes its payload to a
+    sidecar blob and replaces the inline payload with a blob_ref."""
+    log = EventLog(tmp_path / "events.jsonl", run_id="run-big")
+
+    big_payload = {"evidence": {"log_tail": ["x" * 200] * 50}}  # ~10KB inline
+    log.append(
+        event_type="anomaly_detected", source="supervisor",
+        issue=7, payload=big_payload,
+    )
+
+    line = (tmp_path / "events.jsonl").read_text().splitlines()[0]
+    assert len(line.encode("utf-8")) + 1 <= 4096
+
+    evt = json.loads(line)
+    assert evt["payload"]["oversized"] is True
+    blob_rel = evt["payload"]["blob_ref"]
+    assert blob_rel.startswith("blobs/run-big/")
+
+    blob_path = tmp_path / blob_rel
+    assert blob_path.exists()
+    recovered = json.loads(blob_path.read_text())
+    assert recovered == big_payload
+
+
+def test_small_payload_not_offloaded(tmp_path):
+    log = EventLog(tmp_path / "events.jsonl", run_id="run-small")
+
+    log.append(
+        event_type="anomaly_detected", source="supervisor",
+        issue=7, payload={"rule": "x", "evidence": {"exit_code": 1}},
+    )
+
+    evt = json.loads((tmp_path / "events.jsonl").read_text().splitlines()[0])
+    assert "blob_ref" not in evt["payload"]
+    assert "oversized" not in evt["payload"]
+    assert evt["payload"]["evidence"]["exit_code"] == 1

@@ -58,3 +58,44 @@ def test_attached_mode_renders_split_pane_without_crashing():
     assert "step 2" in out
     # issue number surfaces in the top pane
     assert "2" in out
+
+
+def test_anomaly_detected_renders_prominent_in_attached_mode():
+    """Anomalies surface in the Progress panel with the rule name and
+    a red marker so the operator can't miss them."""
+    tty = _FakeTTY()
+    dashboard = Dashboard(stream=tty, force_mode="attached")
+    events = [
+        {"type": "run_started", "source": "supervisor", "issue": 7,
+         "payload": {}},
+        {"type": "ralph_exited", "source": "supervisor", "issue": 7,
+         "payload": {"exit_code": 1}},
+        {"type": "anomaly_detected", "source": "supervisor", "issue": 7,
+         "payload": {
+             "rule": "ralph_nonzero_exit",
+             "evidence": {"exit_code": 1, "log_tail": []},
+         }},
+    ]
+
+    dashboard.render(events)
+
+    out = tty.getvalue()
+    assert "ralph_nonzero_exit" in out
+    # Rich emits ANSI escapes for red — accept either the SGR code or a
+    # literal "anomaly" marker word so the test isn't tied to one renderer.
+    assert ("\x1b[31m" in out) or ("\x1b[91m" in out) or ("ANOMALY" in out.upper())
+
+
+def test_anomaly_detected_in_plain_mode_writes_one_line():
+    buf = io.StringIO()
+    dashboard = Dashboard(stream=buf)
+
+    dashboard.emit({
+        "type": "anomaly_detected", "source": "supervisor", "issue": 7,
+        "payload": {"rule": "ralph_nonzero_exit",
+                    "evidence": {"exit_code": 1}},
+    })
+
+    line = buf.getvalue().splitlines()[0]
+    assert "anomaly_detected" in line
+    assert "ralph_nonzero_exit" in line

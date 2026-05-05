@@ -267,6 +267,57 @@ def test_supervisor_and_ralph_share_events_jsonl(tmp_path):
     assert "ralph_iteration_ended" in ralph_types
 
 
+def test_nonzero_ralph_exit_writes_anomaly_detected_event(tmp_path):
+    """Supervisor must feed events through the AnomalyDetector and write
+    any returned anomalies as anomaly_detected events on events.jsonl with
+    matching run_id and source: supervisor."""
+    _init_repo(tmp_path)
+    supervisor = Supervisor(
+        ralph_path=FIXTURES / "exits_nonzero.sh",
+        cwd=tmp_path,
+        required_tools=_all_tools_present(),
+    )
+
+    exit_code, _ = supervisor.run(issue=21)
+    assert exit_code == 1
+
+    events_path = tmp_path / ".smart-ralph" / "events.jsonl"
+    entries = [json.loads(line) for line in events_path.read_text().splitlines()]
+
+    anomaly_events = [e for e in entries if e["type"] == "anomaly_detected"]
+    assert len(anomaly_events) == 1, (
+        f"expected one anomaly_detected, got types={[e['type'] for e in entries]}"
+    )
+    evt = anomaly_events[0]
+    assert evt["source"] == "supervisor"
+    assert evt["issue"] == 21
+    assert evt["payload"]["rule"] == "ralph_nonzero_exit"
+    assert evt["payload"]["evidence"]["exit_code"] == 1
+    # log_tail came from the stdout the supervisor saw before exit.
+    log_tail = evt["payload"]["evidence"]["log_tail"]
+    assert "ralph: starting" in log_tail
+    assert "ralph: hitting an error" in log_tail
+
+    # All events share the supervisor's run_id.
+    run_ids = {e["run_id"] for e in entries}
+    assert len(run_ids) == 1
+
+
+def test_zero_exit_does_not_write_anomaly_detected(tmp_path):
+    _init_repo(tmp_path)
+    supervisor = Supervisor(
+        ralph_path=FIXTURES / "echo_stdout.sh",
+        cwd=tmp_path,
+        required_tools=_all_tools_present(),
+    )
+
+    supervisor.run(issue=22)
+
+    events_path = tmp_path / ".smart-ralph" / "events.jsonl"
+    entries = [json.loads(line) for line in events_path.read_text().splitlines()]
+    assert not [e for e in entries if e["type"] == "anomaly_detected"]
+
+
 def test_kill_exception_on_sigint_is_logged_as_repair_failed(tmp_path):
     """If RalphClient.kill raises during SIGINT, the failure must be audit-logged
     (not silently swallowed) and the run must still exit cleanly."""
