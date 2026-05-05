@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import shutil
+import traceback
 import uuid
 from collections.abc import Callable
 from pathlib import Path
@@ -123,11 +124,18 @@ class Supervisor:
                     try:
                         router.route(a, context={"issue": a.issue})
                     except Exception as e:
+                        # Include the full traceback so operators can
+                        # locate the failure without re-running with a
+                        # debugger. EventLog auto-offloads >4KB to a
+                        # blob, so even a long traceback is safe.
                         log.append(
                             event_type="diagnosis_failed", source="supervisor",
                             issue=a.issue,
-                            payload={"reason": "router_exception",
-                                     "error": f"{type(e).__name__}: {e}"},
+                            payload={
+                                "reason": "router_exception",
+                                "error": f"{type(e).__name__}: {e}",
+                                "traceback": traceback.format_exc(),
+                            },
                             sync=True,
                         )
 

@@ -45,7 +45,7 @@ _DIAGNOSIS_BLOCK = re.compile(r"<diagnosis>(.*?)</diagnosis>", re.DOTALL)
 # Allowed tools the supervisor exposes to the diagnose-ralph skill. Mirrors
 # the SKILL.md frontmatter; defined here as the source of truth for the
 # headless provider invocation.
-_ALLOWED_TOOLS = [
+ALLOWED_TOOLS = [
     "Read", "Grep", "Glob",
     "Bash(jq:*)", "Bash(git log:*)", "Bash(git status:*)",
     "Bash(git diff:*)", "Bash(cat .ralph/*)",
@@ -66,12 +66,18 @@ _DEFAULT_SKILL_PATH = (
 )
 
 
-# Sentinel for "skip the skill version check entirely" — distinct from
-# default (canonical SKILL.md) and from a user-supplied custom path.
+# Sentinels for skill_path policy. Distinct typed classes (rather than
+# bare object() instances) keep the constructor's type hint exhaustive
+# under strict type checkers.
+class _UseDefault:
+    """Sentinel: use the canonical project SKILL.md."""
+
+
 class _SkipSkillCheck:
-    pass
+    """Sentinel: skip the version check entirely (test harnesses)."""
 
 
+_USE_DEFAULT_SKILL_PATH = _UseDefault()
 SKIP_SKILL_CHECK = _SkipSkillCheck()
 
 
@@ -111,30 +117,27 @@ def read_skill_version(skill_path: Path) -> int:
     )
 
 
-_DEFAULT_PATH_SENTINEL = object()
-
-
 class DiagnosticRouter:
     def __init__(
         self,
         provider: Provider,
         *,
         event_log: EventLog | None = None,
-        skill_path: "Path | _SkipSkillCheck | object" = _DEFAULT_PATH_SENTINEL,
+        skill_path: Path | _UseDefault | _SkipSkillCheck = _USE_DEFAULT_SKILL_PATH,
     ) -> None:
         # Resolve skill_path policy:
-        #   - default sentinel  → canonical project SKILL.md (version-check ON)
-        #   - SKIP_SKILL_CHECK  → caller explicitly opts out (e.g., test harness)
-        #   - any Path          → caller supplies a specific file
+        #   _UseDefault       → canonical project SKILL.md (version-check ON)
+        #   _SkipSkillCheck   → caller explicitly opts out (test harness)
+        #   Path              → caller supplies a specific file
         # Forces the version check to be the default; callers must opt
         # out via SKIP_SKILL_CHECK rather than by silently omitting it.
         resolved: Path | None
-        if skill_path is _DEFAULT_PATH_SENTINEL:
+        if isinstance(skill_path, _UseDefault):
             resolved = _DEFAULT_SKILL_PATH if _DEFAULT_SKILL_PATH.exists() else None
         elif isinstance(skill_path, _SkipSkillCheck):
             resolved = None
         else:
-            resolved = skill_path  # type: ignore[assignment]
+            resolved = skill_path
 
         if resolved is not None:
             actual = read_skill_version(resolved)
@@ -150,13 +153,13 @@ class DiagnosticRouter:
     def route(self, anomaly: Anomaly, *, context: dict[str, Any]) -> Decision:
         self._emit("diagnosis_started", anomaly.issue, {"rule": anomaly.rule})
         prompt = self._build_prompt(anomaly, context)
-        output = self._provider.run_headless(prompt, allowed_tools=list(_ALLOWED_TOOLS))
+        output = self._provider.run_headless(prompt, allowed_tools=list(ALLOWED_TOOLS))
 
         decision = self._try_parse(output)
         if decision is None:
             corrective = self._build_corrective_prompt(prompt, output)
             output = self._provider.run_headless(
-                corrective, allowed_tools=list(_ALLOWED_TOOLS),
+                corrective, allowed_tools=list(ALLOWED_TOOLS),
             )
             decision = self._try_parse(output)
         if decision is None:

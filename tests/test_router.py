@@ -211,6 +211,21 @@ def test_router_accepts_matching_skill_version(tmp_path):
     )  # constructs without raising
 
 
+def test_router_default_skill_path_runs_version_check_against_canonical(monkeypatch):
+    """Constructing the router without skill_path must not silently skip
+    the check. It loads the canonical project SKILL.md and validates
+    against EXPECTED_SKILL_VERSION."""
+    monkeypatch.setattr("smart_ralph.router.EXPECTED_SKILL_VERSION", 999)
+
+    with pytest.raises(SkillVersionError) as exc:
+        DiagnosticRouter(provider=FakeProvider([]))
+
+    msg = str(exc.value)
+    assert "999" in msg  # the bumped expected version
+    assert "diagnose-ralph" in msg
+    assert "SKILL.md" in msg
+
+
 # ── Parser robustness: arrays and multi-block ──────────────
 
 def test_parser_returns_needs_human_when_diagnosis_body_is_json_array():

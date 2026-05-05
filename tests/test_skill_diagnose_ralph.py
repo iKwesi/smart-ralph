@@ -12,7 +12,7 @@ from smart_ralph.router import (
     EXPECTED_SKILL_VERSION,
     DiagnosticRouter,
     SkillVersionError,
-    _ALLOWED_TOOLS,
+    ALLOWED_TOOLS,
     read_skill_version,
 )
 
@@ -72,7 +72,7 @@ def test_router_accepts_the_real_skill_file():
 
 
 def test_skill_allowed_tools_match_router_allowlist():
-    """The skill's frontmatter `allowed-tools:` list and router._ALLOWED_TOOLS
+    """The skill's frontmatter `allowed-tools:` list and router.ALLOWED_TOOLS
     are two sources of truth — drift means the supervisor's --allowed-tools
     invocation diverges from what the on-disk skill advertises. Parse the
     YAML list and assert exact set equality so a missing entry on either
@@ -102,8 +102,8 @@ def test_skill_allowed_tools_match_router_allowlist():
                 # next top-level key
                 break
 
-    assert set(skill_tools) == set(_ALLOWED_TOOLS), (
-        f"SKILL.md allowed-tools and router._ALLOWED_TOOLS have drifted.\n"
-        f"  in SKILL only: {set(skill_tools) - set(_ALLOWED_TOOLS)}\n"
-        f"  in router only: {set(_ALLOWED_TOOLS) - set(skill_tools)}"
+    assert set(skill_tools) == set(ALLOWED_TOOLS), (
+        f"SKILL.md allowed-tools and router.ALLOWED_TOOLS have drifted.\n"
+        f"  in SKILL only: {set(skill_tools) - set(ALLOWED_TOOLS)}\n"
+        f"  in router only: {set(ALLOWED_TOOLS) - set(skill_tools)}"
     )

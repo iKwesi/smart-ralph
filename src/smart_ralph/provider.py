@@ -71,7 +71,7 @@ class ClaudeProvider:
                 text=True,
                 check=False,
                 timeout=self._timeout_seconds,
-                cwd=str(self._cwd) if self._cwd is not None else None,
+                cwd=self._cwd,
             )
         except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
             # Hung or missing binary, kernel hiccup — return "" and let
