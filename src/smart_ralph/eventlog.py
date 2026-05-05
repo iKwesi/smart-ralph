@@ -2,11 +2,17 @@ from __future__ import annotations
 
 import json
 import os
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 SCHEMA_VERSION = 1
+
+# POSIX guarantees atomic appends only up to PIPE_BUF (typically 4096).
+# Lines that would exceed this window have their payload offloaded to a
+# sidecar blob, mirroring lib/ralph-events.sh on the bash side.
+_PIPE_BUF_BYTES = 4096
 
 
 class EventLog:
@@ -34,6 +40,10 @@ class EventLog:
             "payload": payload,
         }
         line = json.dumps(envelope, separators=(",", ":")) + "\n"
+        if len(line.encode("utf-8")) > _PIPE_BUF_BYTES:
+            envelope["payload"] = self._offload_payload(payload)
+            line = json.dumps(envelope, separators=(",", ":")) + "\n"
+
         fd = os.open(self._path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
         try:
             os.write(fd, line.encode("utf-8"))
@@ -41,6 +51,33 @@ class EventLog:
                 os.fsync(fd)
         finally:
             os.close(fd)
+
+    def _offload_payload(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Write payload to a blob under blobs/<run_id>/ and return a tiny
+        replacement payload that references it via blob_ref.
+
+        The Python writer uses uuid4 hex for filenames; the bash writer in
+        lib/ralph-events.sh uses <ts_digits>-<pid>-<random>.json because
+        bash needs platform-portable name uniqueness without a uuid library.
+        Both schemes produce unique paths inside the same blobs/<run_id>/
+        directory; readers should not parse the filename.
+        """
+        events_root = self._path.parent
+        blob_dir = events_root / "blobs" / self._run_id
+        blob_dir.mkdir(parents=True, exist_ok=True)
+        blob_name = f"{uuid.uuid4().hex}.json"
+        blob_path = blob_dir / blob_name
+        # Atomic visibility: stage to a sibling .tmp file, then rename.
+        # The rename only succeeds after the write completes, so readers
+        # never observe a partially-written blob. (Power-loss durability
+        # would additionally require fsync of the file and parent dir;
+        # not in scope for v1.)
+        tmp_path = blob_path.with_suffix(blob_path.suffix + ".tmp")
+        tmp_path.write_text(json.dumps(payload, separators=(",", ":")))
+        os.replace(tmp_path, blob_path)
+        # Path is relative to events_root so readers can resolve it without
+        # needing to know the writer's cwd.
+        return {"oversized": True, "blob_ref": f"blobs/{self._run_id}/{blob_name}"}
 
     def prune_runs(self, keep: int) -> None:
         if not self._path.exists():

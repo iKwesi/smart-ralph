@@ -5,6 +5,7 @@ from pathlib import Path
 
 import pytest
 
+from smart_ralph.anomaly import Anomaly, AnomalyDetector
 from smart_ralph.supervisor import ConcurrentRunError, HealthCheckError, Supervisor
 
 FIXTURES = Path(__file__).parent / "fixtures" / "fake_ralph"
@@ -28,6 +29,38 @@ def _all_tools_present() -> list[str]:
     # Supervisor health check will ask for these; the test environment has them
     # under /usr/bin, /opt/homebrew/bin, etc. — use a non-empty subset we know exists.
     return ["git"]
+
+
+def _stdout_marker_rule(event, _ctx):
+    """Custom rule used by anomaly-detection tests: fires when a stdout
+    line contains the literal "BANG"."""
+    if event.get("type") != "ralph_stdout":
+        return None
+    if "BANG" not in event.get("payload", {}).get("line", ""):
+        return None
+    return Anomaly(
+        rule="stdout_marker_seen",
+        issue=event.get("issue"),
+        evidence={"line": event["payload"]["line"]},
+    )
+
+
+def _build_detector_with_marker_rule() -> AnomalyDetector:
+    detector = AnomalyDetector()
+    detector.register(_stdout_marker_rule)
+    return detector
+
+
+def _write_bang_fixture(path: Path) -> Path:
+    """Fake ralph: prints a BANG stdout line, then exits 0."""
+    bang = path / "bang.sh"
+    bang.write_text(
+        '#!/usr/bin/env bash\n'
+        'echo "BANG goes the issue"\n'
+        'echo "ok"\n'
+    )
+    bang.chmod(0o755)
+    return bang
 
 
 def test_lockfile_is_created_during_run_and_removed_on_exit(tmp_path):
@@ -265,6 +298,143 @@ def test_supervisor_and_ralph_share_events_jsonl(tmp_path):
     ralph_types = [e["type"] for e in ralph_events]
     assert "ralph_iteration_started" in ralph_types
     assert "ralph_iteration_ended" in ralph_types
+
+
+def test_nonzero_ralph_exit_writes_anomaly_detected_event(tmp_path):
+    """Supervisor must feed events through the AnomalyDetector and write
+    any returned anomalies as anomaly_detected events on events.jsonl with
+    matching run_id and source: supervisor."""
+    _init_repo(tmp_path)
+    supervisor = Supervisor(
+        ralph_path=FIXTURES / "exits_nonzero.sh",
+        cwd=tmp_path,
+        required_tools=_all_tools_present(),
+    )
+
+    exit_code, _ = supervisor.run(issue=21)
+    assert exit_code == 1
+
+    events_path = tmp_path / ".smart-ralph" / "events.jsonl"
+    entries = [json.loads(line) for line in events_path.read_text().splitlines()]
+
+    anomaly_events = [e for e in entries if e["type"] == "anomaly_detected"]
+    assert len(anomaly_events) == 1, (
+        f"expected one anomaly_detected, got types={[e['type'] for e in entries]}"
+    )
+    evt = anomaly_events[0]
+    assert evt["source"] == "supervisor"
+    assert evt["issue"] == 21
+    assert evt["payload"]["rule"] == "ralph_nonzero_exit"
+    assert evt["payload"]["evidence"]["exit_code"] == 1
+    # log_tail came from the stdout the supervisor saw before exit.
+    log_tail = evt["payload"]["evidence"]["log_tail"]
+    assert "ralph: starting" in log_tail
+    assert "ralph: hitting an error" in log_tail
+
+    # All events share the supervisor's run_id.
+    run_ids = {e["run_id"] for e in entries}
+    assert len(run_ids) == 1
+
+
+def test_stdout_stream_anomalies_are_recorded_not_just_at_exit(tmp_path):
+    """Anomalies returned while the supervisor is draining ralph's stdout
+    must be written to events.jsonl too — not silently dropped because the
+    loop only records on ralph_exited."""
+    bang = _write_bang_fixture(tmp_path)
+    _init_repo(tmp_path)
+    Supervisor(
+        ralph_path=bang,
+        cwd=tmp_path,
+        required_tools=_all_tools_present(),
+        detector_factory=_build_detector_with_marker_rule,
+    ).run(issue=99)
+
+    events_path = tmp_path / ".smart-ralph" / "events.jsonl"
+    entries = [json.loads(line) for line in events_path.read_text().splitlines()]
+    anomalies = [e for e in entries if e["type"] == "anomaly_detected"]
+    assert any(a["payload"]["rule"] == "stdout_marker_seen" for a in anomalies), (
+        f"expected stdout_marker_seen anomaly, got {[a['payload']['rule'] for a in anomalies]}"
+    )
+
+
+def test_each_run_constructs_a_fresh_detector(tmp_path):
+    """Repeated run() calls on the same Supervisor must construct a fresh
+    detector each time. State (e.g., the bounded log_tail or any per-rule
+    counters) must not leak between runs."""
+    bang = _write_bang_fixture(tmp_path)
+    _init_repo(tmp_path)
+
+    constructed: list[AnomalyDetector] = []
+
+    def factory() -> AnomalyDetector:
+        d = _build_detector_with_marker_rule()
+        constructed.append(d)
+        return d
+
+    supervisor = Supervisor(
+        ralph_path=bang,
+        cwd=tmp_path,
+        required_tools=_all_tools_present(),
+        detector_factory=factory,
+    )
+
+    supervisor.run(issue=101)
+    supervisor.run(issue=102)
+
+    assert len(constructed) == 2
+    assert constructed[0] is not constructed[1]
+
+
+def test_default_detector_factory_isolates_log_tail_across_runs(tmp_path):
+    """No factory injected — default behavior must give each run a fresh
+    detector, observable via log_tail isolation. The fixture prints
+    exactly 3 stdout lines per invocation; two back-to-back runs that
+    shared state would yield a 6-line log_tail in the second anomaly."""
+    _init_repo(tmp_path)
+    supervisor = Supervisor(
+        ralph_path=FIXTURES / "exits_nonzero.sh",
+        cwd=tmp_path,
+        required_tools=_all_tools_present(),
+    )
+    supervisor.run(issue=201)
+    supervisor.run(issue=202)
+
+    events_path = tmp_path / ".smart-ralph" / "events.jsonl"
+    entries = [json.loads(line) for line in events_path.read_text().splitlines()]
+
+    # Group anomaly_detected events by run_id to inspect each run in isolation.
+    anomalies_by_run: dict[str, list[dict]] = {}
+    for e in entries:
+        if e["type"] == "anomaly_detected":
+            anomalies_by_run.setdefault(e["run_id"], []).append(e)
+
+    assert len(anomalies_by_run) == 2, (
+        f"expected 2 distinct run_ids in anomaly events, got {list(anomalies_by_run)}"
+    )
+    for run_id, anomalies in anomalies_by_run.items():
+        assert len(anomalies) == 1
+        log_tail = anomalies[0]["payload"]["evidence"]["log_tail"]
+        # exits_nonzero.sh emits 3 stdout lines per run. If state had
+        # leaked from a previous run, log_tail would carry up to 6 lines.
+        assert len(log_tail) <= 3, (
+            f"run {run_id} log_tail has {len(log_tail)} lines — state leaked"
+            f" from a prior run (fixture prints only 3 per invocation)"
+        )
+
+
+def test_zero_exit_does_not_write_anomaly_detected(tmp_path):
+    _init_repo(tmp_path)
+    supervisor = Supervisor(
+        ralph_path=FIXTURES / "echo_stdout.sh",
+        cwd=tmp_path,
+        required_tools=_all_tools_present(),
+    )
+
+    supervisor.run(issue=22)
+
+    events_path = tmp_path / ".smart-ralph" / "events.jsonl"
+    entries = [json.loads(line) for line in events_path.read_text().splitlines()]
+    assert not [e for e in entries if e["type"] == "anomaly_detected"]
 
 
 def test_kill_exception_on_sigint_is_logged_as_repair_failed(tmp_path):

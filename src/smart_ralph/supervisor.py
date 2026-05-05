@@ -3,8 +3,10 @@ from __future__ import annotations
 import os
 import shutil
 import uuid
+from collections.abc import Callable
 from pathlib import Path
 
+from smart_ralph.anomaly import Anomaly, AnomalyDetector
 from smart_ralph.eventlog import EventLog
 from smart_ralph.ralph_client import RalphClient
 
@@ -27,6 +29,14 @@ def _pid_alive(pid: int) -> bool:
     return True
 
 
+def _default_detector_factory() -> AnomalyDetector:
+    """Default factory used by Supervisor when no detector_factory is
+    injected. A named function (rather than the class itself) keeps the
+    Callable[[], AnomalyDetector] type literal under strict type checkers
+    that distinguish type[AnomalyDetector] from a no-arg callable."""
+    return AnomalyDetector()
+
+
 class Supervisor:
     def __init__(
         self,
@@ -34,11 +44,20 @@ class Supervisor:
         cwd: Path,
         required_tools: list[str],
         retention_runs: int = 50,
+        *,
+        detector_factory: Callable[[], AnomalyDetector] = _default_detector_factory,
     ) -> None:
         self._ralph_path = Path(ralph_path)
         self._cwd = Path(cwd)
         self._required_tools = required_tools
         self._retention_runs = retention_runs
+        # A factory (not an instance) is injected so each run() gets a
+        # fresh detector. This avoids state leaking — the bounded log_tail
+        # or any per-rule counters — across repeated runs on the same
+        # Supervisor instance. Callers that want shared state across runs
+        # can pass a factory that returns the same instance, but they opt
+        # in explicitly.
+        self._detector_factory = detector_factory
 
     def run(self, issue: int) -> tuple[int, list[dict]]:
         if not isinstance(issue, int) or issue <= 0:
@@ -71,9 +90,19 @@ class Supervisor:
         run_id = uuid.uuid4().hex[:16]
         log = EventLog(meta_dir / "events.jsonl", run_id=run_id)
         log.prune_runs(keep=self._retention_runs)
+        detector = self._detector_factory()
         process = None
         exit_code = 1
         events: list[dict] = []
+
+        def _record_anomalies(anomalies: list[Anomaly]) -> None:
+            for a in anomalies:
+                log.append(
+                    event_type="anomaly_detected", source="supervisor",
+                    issue=a.issue,
+                    payload={"rule": a.rule, "evidence": a.evidence},
+                    sync=True,
+                )
 
         try:
             log.append(
@@ -91,12 +120,21 @@ class Supervisor:
                 event_type="ralph_spawned", source="supervisor",
                 issue=issue, payload={"pid": process.pid}, sync=True,
             )
-            events = list(process.events())
+            events = []
+            for evt in process.events():
+                events.append(evt)
+                _record_anomalies(detector.observe(evt))
             exit_code = process.wait()
+            ralph_exited_event = {
+                "type": "ralph_exited",
+                "issue": issue,
+                "payload": {"exit_code": exit_code},
+            }
             log.append(
                 event_type="ralph_exited", source="supervisor",
                 issue=issue, payload={"exit_code": exit_code}, sync=True,
             )
+            _record_anomalies(detector.observe(ralph_exited_event))
             return exit_code, events
         except KeyboardInterrupt:
             if process is not None:

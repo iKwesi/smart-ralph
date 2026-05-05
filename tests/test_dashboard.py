@@ -1,4 +1,5 @@
 import io
+import re
 
 from smart_ralph.dashboard import Dashboard
 
@@ -58,3 +59,47 @@ def test_attached_mode_renders_split_pane_without_crashing():
     assert "step 2" in out
     # issue number surfaces in the top pane
     assert "2" in out
+
+
+def test_anomaly_detected_renders_prominent_in_attached_mode():
+    """Anomalies surface in the Progress panel with the rule name and
+    a red marker so the operator can't miss them."""
+    tty = _FakeTTY()
+    dashboard = Dashboard(stream=tty, force_mode="attached")
+    events = [
+        {"type": "run_started", "source": "supervisor", "issue": 7,
+         "payload": {}},
+        {"type": "ralph_exited", "source": "supervisor", "issue": 7,
+         "payload": {"exit_code": 1}},
+        {"type": "anomaly_detected", "source": "supervisor", "issue": 7,
+         "payload": {
+             "rule": "ralph_nonzero_exit",
+             "evidence": {"exit_code": 1, "log_tail": []},
+         }},
+    ]
+
+    dashboard.render(events)
+
+    out = tty.getvalue()
+    assert "ralph_nonzero_exit" in out
+    # Rich emits an ANSI red SGR escape when rendering [bold red] markup.
+    # The exact form may be \x1b[31m, \x1b[91m, or combined like
+    # \x1b[1;31m (bold + red), so look for the color code (31 / 91)
+    # appearing inside any SGR escape.
+    sgr_red = re.search(r"\x1b\[[0-9;]*?(?:31|91)[0-9;]*m", out)
+    assert sgr_red, f"expected red ANSI in dashboard output, got: {out!r}"
+
+
+def test_anomaly_detected_in_plain_mode_writes_one_line():
+    buf = io.StringIO()
+    dashboard = Dashboard(stream=buf)
+
+    dashboard.emit({
+        "type": "anomaly_detected", "source": "supervisor", "issue": 7,
+        "payload": {"rule": "ralph_nonzero_exit",
+                    "evidence": {"exit_code": 1}},
+    })
+
+    line = buf.getvalue().splitlines()[0]
+    assert "anomaly_detected" in line
+    assert "ralph_nonzero_exit" in line

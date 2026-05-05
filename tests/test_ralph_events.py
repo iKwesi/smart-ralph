@@ -431,8 +431,7 @@ def test_ralph_run_emits_ralph_error_on_iteration_exhaustion(tmp_path):
     )
     claude_shim.chmod(0o755)
     # Copy fake gh alongside
-    import shutil as _shutil
-    _shutil.copy(FAKE_TOOLS / "gh", shim_dir / "gh")
+    shutil.copy(FAKE_TOOLS / "gh", shim_dir / "gh")
     (shim_dir / "gh").chmod(0o755)
 
     events_path = tmp_path / ".smart-ralph" / "events.jsonl"

@@ -67,3 +67,85 @@ def test_prune_runs_keeps_only_last_n_runs(tmp_path):
 
 def test_prune_runs_on_missing_file_is_noop(tmp_path):
     EventLog(tmp_path / "events.jsonl", run_id="run-1").prune_runs(keep=50)
+
+
+# ── Oversized payload offload (issue #7 — anomaly evidence may be huge) ──
+
+def test_oversized_payload_offloaded_to_blob_sidecar(tmp_path):
+    """Match the ralph-events.sh contract on the supervisor side: any line
+    that would exceed the 4KB PIPE_BUF window writes its payload to a
+    sidecar blob and replaces the inline payload with a blob_ref."""
+    log = EventLog(tmp_path / "events.jsonl", run_id="run-big")
+
+    big_payload = {"evidence": {"log_tail": ["x" * 200] * 50}}  # ~10KB inline
+    log.append(
+        event_type="anomaly_detected", source="supervisor",
+        issue=7, payload=big_payload,
+    )
+
+    line = (tmp_path / "events.jsonl").read_text().splitlines()[0]
+    assert len(line.encode("utf-8")) + 1 <= 4096
+
+    evt = json.loads(line)
+    assert evt["payload"]["oversized"] is True
+    blob_rel = evt["payload"]["blob_ref"]
+    assert blob_rel.startswith("blobs/run-big/")
+
+    blob_path = tmp_path / blob_rel
+    assert blob_path.exists()
+    recovered = json.loads(blob_path.read_text())
+    assert recovered == big_payload
+
+
+def test_offload_boundary_exactly_at_pipe_buf(tmp_path):
+    """Pin the >4096 vs ≤4096 boundary: a line at exactly 4096 bytes
+    stays inline; one byte more triggers offload."""
+    log = EventLog(tmp_path / "events.jsonl", run_id="run-edge")
+
+    # Sized so the envelope JSON serializes to exactly 4096 bytes inclusive
+    # of the trailing newline. The "pad" field absorbs the difference.
+    base_payload = {"pad": ""}
+    base_envelope = {
+        "schema_version": 1,
+        "ts": "2026-05-05T00:00:00.000Z",
+        "run_id": "run-edge",
+        "type": "anomaly_detected",
+        "source": "supervisor",
+        "issue": 7,
+        "payload": base_payload,
+    }
+    base_line = json.dumps(base_envelope, separators=(",", ":")) + "\n"
+    pad_size = 4096 - len(base_line.encode("utf-8"))
+    assert pad_size > 0
+
+    log.append(
+        event_type="anomaly_detected", source="supervisor",
+        issue=7, payload={"pad": "x" * pad_size},
+    )
+    inline = json.loads((tmp_path / "events.jsonl").read_text().splitlines()[0])
+    assert "blob_ref" not in inline["payload"], (
+        "exactly-4096-byte line should stay inline"
+    )
+
+    # One byte over → offload.
+    (tmp_path / "events.jsonl").unlink()
+    log.append(
+        event_type="anomaly_detected", source="supervisor",
+        issue=7, payload={"pad": "x" * (pad_size + 1)},
+    )
+    over = json.loads((tmp_path / "events.jsonl").read_text().splitlines()[0])
+    assert over["payload"]["oversized"] is True
+
+
+def test_small_payload_not_offloaded(tmp_path):
+    log = EventLog(tmp_path / "events.jsonl", run_id="run-small")
+
+    log.append(
+        event_type="anomaly_detected", source="supervisor",
+        issue=7, payload={"rule": "x", "evidence": {"exit_code": 1}},
+    )
+
+    evt = json.loads((tmp_path / "events.jsonl").read_text().splitlines()[0])
+    assert "blob_ref" not in evt["payload"]
+    assert "oversized" not in evt["payload"]
+    assert evt["payload"]["evidence"]["exit_code"] == 1
