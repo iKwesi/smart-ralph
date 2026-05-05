@@ -9,9 +9,15 @@ from __future__ import annotations
 import json
 from typing import Any
 
+import pytest
+
 from smart_ralph.anomaly import Anomaly
 from smart_ralph.eventlog import EventLog
-from smart_ralph.router import DiagnosticRouter
+from smart_ralph.router import (
+    SKIP_SKILL_CHECK,
+    DiagnosticRouter,
+    SkillVersionError,
+)
 
 
 class FakeProvider:
@@ -171,11 +177,6 @@ def test_two_malformed_responses_escalate_to_needs_human(tmp_path):
 
 # ── Slice 5: skill version mismatch refuses to run ─────────
 
-import pytest
-
-from smart_ralph.router import SkillVersionError
-
-
 def _write_skill(path, *, version: int) -> None:
     path.write_text(
         f"---\n"
@@ -208,3 +209,39 @@ def test_router_accepts_matching_skill_version(tmp_path):
         provider=FakeProvider([_VALID_DIAGNOSIS]),
         skill_path=skill_md,
     )  # constructs without raising
+
+
+# ── Parser robustness: arrays and multi-block ──────────────
+
+def test_parser_returns_needs_human_when_diagnosis_body_is_json_array():
+    """If the model emits a JSON array (or any non-object), the parser
+    must not crash. Two malformed responses → needs_human."""
+    arr = '<diagnosis>[1,2,3]</diagnosis>'
+    provider = FakeProvider(responses=[arr, arr])
+    router = DiagnosticRouter(provider=provider, skill_path=SKIP_SKILL_CHECK)
+
+    decision = router.route(_anomaly(), context=_ctx())
+
+    assert decision.needs_human is True
+    assert decision.scope == "unknown"
+
+
+def test_parser_picks_first_when_multiple_diagnosis_blocks_present():
+    """The SKILL.md hard-rule says exactly one block; if the model emits
+    more than one, the non-greedy regex picks the first. Pin that
+    tie-break so future parser changes can't silently shift behaviour."""
+    two_blocks = (
+        '<diagnosis>{"scope":"orchestrator","fix_type":"restart",'
+        '"action":{},"confidence":"high","summary":"first","evidence":{}}'
+        '</diagnosis>\n'
+        '<diagnosis>{"scope":"product","fix_type":null,'
+        '"action":null,"confidence":"low","summary":"second","evidence":{}}'
+        '</diagnosis>'
+    )
+    provider = FakeProvider(responses=[two_blocks])
+    router = DiagnosticRouter(provider=provider, skill_path=SKIP_SKILL_CHECK)
+
+    decision = router.route(_anomaly(), context=_ctx())
+
+    assert decision.summary == "first"
+    assert decision.scope == "orchestrator"

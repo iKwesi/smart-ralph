@@ -56,6 +56,24 @@ _ALLOWED_TOOLS = [
 _SKILL_SOURCE = "skill:diagnose-ralph"
 EXPECTED_SKILL_VERSION = 1
 
+# Canonical on-disk location of the diagnose-ralph SKILL.md, relative to
+# the repo root. Used as the default for DiagnosticRouter.skill_path so
+# callers cannot accidentally bypass the version check by forgetting to
+# pass it.
+_DEFAULT_SKILL_PATH = (
+    Path(__file__).resolve().parent.parent.parent
+    / ".claude" / "skills" / "diagnose-ralph" / "SKILL.md"
+)
+
+
+# Sentinel for "skip the skill version check entirely" — distinct from
+# default (canonical SKILL.md) and from a user-supplied custom path.
+class _SkipSkillCheck:
+    pass
+
+
+SKIP_SKILL_CHECK = _SkipSkillCheck()
+
 
 class SkillVersionError(RuntimeError):
     """Raised when the on-disk skill's frontmatter version does not match
@@ -66,7 +84,7 @@ class SkillVersionError(RuntimeError):
 _FRONTMATTER = re.compile(r"^---\s*\n(.*?)\n---\s*\n", re.DOTALL)
 
 
-def _read_skill_version(skill_path: Path) -> int:
+def read_skill_version(skill_path: Path) -> int:
     """Parse the `version:` field out of SKILL.md frontmatter without
     pulling in a YAML dependency. Frontmatter is YAML by convention but
     we only need one integer field."""
@@ -93,21 +111,38 @@ def _read_skill_version(skill_path: Path) -> int:
     )
 
 
+_DEFAULT_PATH_SENTINEL = object()
+
+
 class DiagnosticRouter:
     def __init__(
         self,
         provider: Provider,
         *,
         event_log: EventLog | None = None,
-        skill_path: Path | None = None,
+        skill_path: "Path | _SkipSkillCheck | object" = _DEFAULT_PATH_SENTINEL,
     ) -> None:
-        if skill_path is not None:
-            actual = _read_skill_version(skill_path)
+        # Resolve skill_path policy:
+        #   - default sentinel  → canonical project SKILL.md (version-check ON)
+        #   - SKIP_SKILL_CHECK  → caller explicitly opts out (e.g., test harness)
+        #   - any Path          → caller supplies a specific file
+        # Forces the version check to be the default; callers must opt
+        # out via SKIP_SKILL_CHECK rather than by silently omitting it.
+        resolved: Path | None
+        if skill_path is _DEFAULT_PATH_SENTINEL:
+            resolved = _DEFAULT_SKILL_PATH if _DEFAULT_SKILL_PATH.exists() else None
+        elif isinstance(skill_path, _SkipSkillCheck):
+            resolved = None
+        else:
+            resolved = skill_path  # type: ignore[assignment]
+
+        if resolved is not None:
+            actual = read_skill_version(resolved)
             if actual != EXPECTED_SKILL_VERSION:
                 raise SkillVersionError(
                     f"diagnose-ralph SKILL.md version {actual} does not "
                     f"match supervisor expected version "
-                    f"{EXPECTED_SKILL_VERSION} ({skill_path})"
+                    f"{EXPECTED_SKILL_VERSION} ({resolved})"
                 )
         self._provider = provider
         self._event_log = event_log
@@ -177,6 +212,11 @@ class DiagnosticRouter:
             return None
         try:
             body = json.loads(match.group(1))
+            # Guard against arrays / non-object bodies before indexing —
+            # body["scope"] on a list raises TypeError, on a string raises
+            # TypeError, neither of which json.loads catches.
+            if not isinstance(body, dict):
+                return None
             return Decision(
                 scope=body["scope"],
                 fix_type=body.get("fix_type"),
@@ -185,7 +225,7 @@ class DiagnosticRouter:
                 summary=body["summary"],
                 evidence=body.get("evidence", {}),
             )
-        except (json.JSONDecodeError, KeyError):
+        except (json.JSONDecodeError, KeyError, TypeError):
             return None
 
     def _build_corrective_prompt(self, original: str, bad_output: str) -> str:

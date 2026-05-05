@@ -19,13 +19,20 @@ _DEFAULT_TIMEOUT_SECONDS = 300
 
 class ClaudeProvider:
     """v1 Provider implementation: spawns `claude -p` with the dontAsk
-    permission mode and a per-skill allowlist."""
+    permission mode and a per-skill allowlist.
+
+    Subprocess-level failures (timeout, missing binary, OSError from a
+    transient kernel issue) are absorbed and surfaced as an empty stdout
+    string. The router's parser treats empty/malformed output as a
+    retry-then-escalate path, so a hung or missing claude can never take
+    down the supervised orchestration."""
 
     def __init__(
         self,
         claude_path: Path | None = None,
         *,
         timeout_seconds: int = _DEFAULT_TIMEOUT_SECONDS,
+        cwd: Path | None = None,
     ) -> None:
         if claude_path is None:
             override = os.environ.get("SMART_RALPH_CLAUDE_PATH")
@@ -41,6 +48,9 @@ class ClaudeProvider:
                 claude_path = Path(found)
         self._claude_path = Path(claude_path)
         self._timeout_seconds = timeout_seconds
+        # Setting cwd lets the child claude process discover the project's
+        # `.claude/skills/` tree. Default None inherits the parent's cwd.
+        self._cwd = Path(cwd) if cwd is not None else None
 
     def run_headless(self, prompt: str, *, allowed_tools: list[str]) -> str:
         argv = [
@@ -54,11 +64,17 @@ class ClaudeProvider:
             argv += ["--allowed-tools", ",".join(allowed_tools)]
         argv.append(prompt)
 
-        result = subprocess.run(
-            argv,
-            capture_output=True,
-            text=True,
-            check=False,
-            timeout=self._timeout_seconds,
-        )
+        try:
+            result = subprocess.run(
+                argv,
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=self._timeout_seconds,
+                cwd=str(self._cwd) if self._cwd is not None else None,
+            )
+        except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+            # Hung or missing binary, kernel hiccup — return "" and let
+            # the router's malformed-output retry/escalate path handle it.
+            return ""
         return result.stdout

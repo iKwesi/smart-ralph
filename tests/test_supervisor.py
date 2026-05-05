@@ -7,7 +7,7 @@ import pytest
 
 from smart_ralph.anomaly import Anomaly, AnomalyDetector
 from smart_ralph.eventlog import EventLog
-from smart_ralph.router import DiagnosticRouter
+from smart_ralph.router import SKIP_SKILL_CHECK, DiagnosticRouter
 from smart_ralph.supervisor import ConcurrentRunError, HealthCheckError, Supervisor
 
 FIXTURES = Path(__file__).parent / "fixtures" / "fake_ralph"
@@ -471,6 +471,44 @@ def test_supervisor_routes_anomalies_to_diagnostic_router(tmp_path):
     started_idx = types.index("diagnosis_started")
     completed_idx = types.index("diagnosis_completed")
     assert anomaly_idx < started_idx < completed_idx
+
+
+def test_router_exception_does_not_kill_supervisor_run(tmp_path):
+    """A misbehaving router (provider crash, network, anything) must not
+    take the whole orchestration down. Failure is logged as
+    diagnosis_failed and the supervisor continues normally."""
+
+    class _ExplodingProvider:
+        def run_headless(self, prompt, *, allowed_tools):
+            raise RuntimeError("simulated provider explosion")
+
+    def router_factory(log: EventLog) -> DiagnosticRouter:
+        return DiagnosticRouter(
+            provider=_ExplodingProvider(),
+            event_log=log,
+            skill_path=SKIP_SKILL_CHECK,
+        )
+
+    _init_repo(tmp_path)
+    supervisor = Supervisor(
+        ralph_path=FIXTURES / "exits_nonzero.sh",
+        cwd=tmp_path,
+        required_tools=_all_tools_present(),
+        router_factory=router_factory,
+    )
+    exit_code, _ = supervisor.run(issue=77)
+    # Run completes; ralph's exit code is what surfaces.
+    assert exit_code == 1
+
+    events_path = tmp_path / ".smart-ralph" / "events.jsonl"
+    types = [
+        json.loads(line)["type"]
+        for line in events_path.read_text().splitlines()
+    ]
+    assert "anomaly_detected" in types
+    assert "diagnosis_failed" in types
+    # Supervisor's lifecycle terminates cleanly.
+    assert types[-1] == "run_ended"
 
 
 def test_supervisor_without_router_factory_logs_anomaly_only(tmp_path):

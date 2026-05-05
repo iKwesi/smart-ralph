@@ -72,3 +72,45 @@ def test_provider_uses_env_override_for_claude_path(tmp_path, monkeypatch):
     out = provider.run_headless("x", allowed_tools=[])
 
     assert "<diagnosis>" in out
+
+
+def test_run_headless_returns_empty_string_on_timeout(tmp_path):
+    """A hung claude must not propagate TimeoutExpired up to the supervisor.
+    The provider returns "" so the router treats the response as malformed
+    and runs its retry/escalation path instead of crashing the run."""
+    # Shim sleeps longer than the provider timeout.
+    shim = _write_claude_shim(tmp_path, 'sleep 5\n')
+    provider = ClaudeProvider(claude_path=shim, timeout_seconds=1)
+
+    out = provider.run_headless("x", allowed_tools=[])
+    assert out == ""
+
+
+def test_run_headless_returns_empty_string_when_binary_missing(tmp_path):
+    """If the claude binary disappears between health-check and invocation
+    (or the shim was never executable), the provider absorbs the FileNotFoundError
+    rather than crashing the supervisor."""
+    missing = tmp_path / "does-not-exist"
+    provider = ClaudeProvider(claude_path=missing, timeout_seconds=1)
+
+    out = provider.run_headless("x", allowed_tools=[])
+    assert out == ""
+
+
+def test_run_headless_runs_in_supplied_cwd(tmp_path):
+    """The provider must run claude in a specific cwd so the on-disk
+    .claude/skills/ tree can be discovered. Otherwise SKILL.md resolution
+    depends on whatever directory the supervisor was launched from."""
+    workdir = tmp_path / "workspace"
+    workdir.mkdir()
+    shim = _write_claude_shim(
+        tmp_path,
+        f'pwd > {tmp_path / "captured-cwd.txt"}\n'
+        f'echo "<diagnosis>{{}}</diagnosis>"\n',
+    )
+
+    provider = ClaudeProvider(claude_path=shim, cwd=workdir)
+    provider.run_headless("x", allowed_tools=[])
+
+    captured = (tmp_path / "captured-cwd.txt").read_text().strip()
+    assert Path(captured).resolve() == workdir.resolve()

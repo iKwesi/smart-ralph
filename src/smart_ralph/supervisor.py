@@ -116,7 +116,20 @@ class Supervisor:
                     # router builds its prompt from anomaly + context. Richer
                     # state-snapshot context lands when state.json reading
                     # is wired (issue #9 territory).
-                    router.route(a, context={"issue": a.issue})
+                    #
+                    # A routing failure (provider timeout, network, parser
+                    # crash, etc.) must never take the whole supervised run
+                    # down. We log it as diagnosis_failed and continue.
+                    try:
+                        router.route(a, context={"issue": a.issue})
+                    except Exception as e:
+                        log.append(
+                            event_type="diagnosis_failed", source="supervisor",
+                            issue=a.issue,
+                            payload={"reason": "router_exception",
+                                     "error": f"{type(e).__name__}: {e}"},
+                            sync=True,
+                        )
 
         try:
             log.append(
