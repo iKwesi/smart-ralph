@@ -29,6 +29,14 @@ def _pid_alive(pid: int) -> bool:
     return True
 
 
+def _default_detector_factory() -> AnomalyDetector:
+    """Default factory used by Supervisor when no detector_factory is
+    injected. A named function (rather than the class itself) keeps the
+    Callable[[], AnomalyDetector] type literal under strict type checkers
+    that distinguish type[AnomalyDetector] from a no-arg callable."""
+    return AnomalyDetector()
+
+
 class Supervisor:
     def __init__(
         self,
@@ -37,7 +45,7 @@ class Supervisor:
         required_tools: list[str],
         retention_runs: int = 50,
         *,
-        detector_factory: Callable[[], AnomalyDetector] = AnomalyDetector,
+        detector_factory: Callable[[], AnomalyDetector] = _default_detector_factory,
     ) -> None:
         self._ralph_path = Path(ralph_path)
         self._cwd = Path(cwd)

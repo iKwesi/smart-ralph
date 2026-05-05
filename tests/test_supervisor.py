@@ -31,6 +31,38 @@ def _all_tools_present() -> list[str]:
     return ["git"]
 
 
+def _stdout_marker_rule(event, _ctx):
+    """Custom rule used by anomaly-detection tests: fires when a stdout
+    line contains the literal "BANG"."""
+    if event.get("type") != "ralph_stdout":
+        return None
+    if "BANG" not in event.get("payload", {}).get("line", ""):
+        return None
+    return Anomaly(
+        rule="stdout_marker_seen",
+        issue=event.get("issue"),
+        evidence={"line": event["payload"]["line"]},
+    )
+
+
+def _build_detector_with_marker_rule() -> AnomalyDetector:
+    detector = AnomalyDetector()
+    detector.register(_stdout_marker_rule)
+    return detector
+
+
+def _write_bang_fixture(path: Path) -> Path:
+    """Fake ralph: prints a BANG stdout line, then exits 0."""
+    bang = path / "bang.sh"
+    bang.write_text(
+        '#!/usr/bin/env bash\n'
+        'echo "BANG goes the issue"\n'
+        'echo "ok"\n'
+    )
+    bang.chmod(0o755)
+    return bang
+
+
 def test_lockfile_is_created_during_run_and_removed_on_exit(tmp_path):
     _init_repo(tmp_path)
     supervisor = Supervisor(
@@ -304,36 +336,6 @@ def test_nonzero_ralph_exit_writes_anomaly_detected_event(tmp_path):
     assert len(run_ids) == 1
 
 
-def _stdout_marker_rule(event, _ctx):
-    if event.get("type") != "ralph_stdout":
-        return None
-    if "BANG" not in event.get("payload", {}).get("line", ""):
-        return None
-    return Anomaly(
-        rule="stdout_marker_seen",
-        issue=event.get("issue"),
-        evidence={"line": event["payload"]["line"]},
-    )
-
-
-def _build_detector_with_marker_rule() -> AnomalyDetector:
-    detector = AnomalyDetector()
-    detector.register(_stdout_marker_rule)
-    return detector
-
-
-def _write_bang_fixture(path: Path) -> Path:
-    """Fake ralph: prints a BANG stdout line, then exits 0."""
-    bang = path / "bang.sh"
-    bang.write_text(
-        '#!/usr/bin/env bash\n'
-        'echo "BANG goes the issue"\n'
-        'echo "ok"\n'
-    )
-    bang.chmod(0o755)
-    return bang
-
-
 def test_stdout_stream_anomalies_are_recorded_not_just_at_exit(tmp_path):
     """Anomalies returned while the supervisor is draining ralph's stdout
     must be written to events.jsonl too — not silently dropped because the
@@ -383,13 +385,14 @@ def test_each_run_constructs_a_fresh_detector(tmp_path):
     assert constructed[0] is not constructed[1]
 
 
-def test_default_detector_factory_isolates_runs(tmp_path):
-    """No factory injected — default behavior must still produce a fresh
-    detector per run (regression on the asymmetry the factory refactor
-    eliminates)."""
+def test_default_detector_factory_isolates_log_tail_across_runs(tmp_path):
+    """No factory injected — default behavior must give each run a fresh
+    detector, observable via log_tail isolation. The fixture prints
+    exactly 3 stdout lines per invocation; two back-to-back runs that
+    shared state would yield a 6-line log_tail in the second anomaly."""
     _init_repo(tmp_path)
     supervisor = Supervisor(
-        ralph_path=FIXTURES / "echo_stdout.sh",
+        ralph_path=FIXTURES / "exits_nonzero.sh",
         cwd=tmp_path,
         required_tools=_all_tools_present(),
     )
@@ -398,9 +401,25 @@ def test_default_detector_factory_isolates_runs(tmp_path):
 
     events_path = tmp_path / ".smart-ralph" / "events.jsonl"
     entries = [json.loads(line) for line in events_path.read_text().splitlines()]
-    # Both runs landed; their run_ids differ.
-    run_ids = {e["run_id"] for e in entries}
-    assert len(run_ids) == 2
+
+    # Group anomaly_detected events by run_id to inspect each run in isolation.
+    anomalies_by_run: dict[str, list[dict]] = {}
+    for e in entries:
+        if e["type"] == "anomaly_detected":
+            anomalies_by_run.setdefault(e["run_id"], []).append(e)
+
+    assert len(anomalies_by_run) == 2, (
+        f"expected 2 distinct run_ids in anomaly events, got {list(anomalies_by_run)}"
+    )
+    for run_id, anomalies in anomalies_by_run.items():
+        assert len(anomalies) == 1
+        log_tail = anomalies[0]["payload"]["evidence"]["log_tail"]
+        # exits_nonzero.sh emits 3 stdout lines per run. If state had
+        # leaked from a previous run, log_tail would carry up to 6 lines.
+        assert len(log_tail) <= 3, (
+            f"run {run_id} log_tail has {len(log_tail)} lines — state leaked"
+            f" from a prior run (fixture prints only 3 per invocation)"
+        )
 
 
 def test_zero_exit_does_not_write_anomaly_detected(tmp_path):
