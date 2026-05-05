@@ -304,40 +304,47 @@ def test_nonzero_ralph_exit_writes_anomaly_detected_event(tmp_path):
     assert len(run_ids) == 1
 
 
-def test_stdout_stream_anomalies_are_recorded_not_just_at_exit(tmp_path):
-    """Anomalies returned while the supervisor is draining ralph's stdout
-    must be written to events.jsonl too — not silently dropped because the
-    loop only records on ralph_exited."""
+def _stdout_marker_rule(event, _ctx):
+    if event.get("type") != "ralph_stdout":
+        return None
+    if "BANG" not in event.get("payload", {}).get("line", ""):
+        return None
+    return Anomaly(
+        rule="stdout_marker_seen",
+        issue=event.get("issue"),
+        evidence={"line": event["payload"]["line"]},
+    )
+
+
+def _build_detector_with_marker_rule() -> AnomalyDetector:
     detector = AnomalyDetector()
+    detector.register(_stdout_marker_rule)
+    return detector
 
-    def stdout_marker_rule(event, _ctx):
-        if event.get("type") != "ralph_stdout":
-            return None
-        if "BANG" not in event.get("payload", {}).get("line", ""):
-            return None
-        return Anomaly(
-            rule="stdout_marker_seen",
-            issue=event.get("issue"),
-            evidence={"line": event["payload"]["line"]},
-        )
 
-    detector.register(stdout_marker_rule)
-
-    # fixture stub that prints a stdout line containing "BANG", then exits 0
-    bang = tmp_path / "bang.sh"
+def _write_bang_fixture(path: Path) -> Path:
+    """Fake ralph: prints a BANG stdout line, then exits 0."""
+    bang = path / "bang.sh"
     bang.write_text(
         '#!/usr/bin/env bash\n'
         'echo "BANG goes the issue"\n'
         'echo "ok"\n'
     )
     bang.chmod(0o755)
+    return bang
 
+
+def test_stdout_stream_anomalies_are_recorded_not_just_at_exit(tmp_path):
+    """Anomalies returned while the supervisor is draining ralph's stdout
+    must be written to events.jsonl too — not silently dropped because the
+    loop only records on ralph_exited."""
+    bang = _write_bang_fixture(tmp_path)
     _init_repo(tmp_path)
     Supervisor(
         ralph_path=bang,
         cwd=tmp_path,
         required_tools=_all_tools_present(),
-        detector=detector,
+        detector_factory=_build_detector_with_marker_rule,
     ).run(issue=99)
 
     events_path = tmp_path / ".smart-ralph" / "events.jsonl"
@@ -346,6 +353,54 @@ def test_stdout_stream_anomalies_are_recorded_not_just_at_exit(tmp_path):
     assert any(a["payload"]["rule"] == "stdout_marker_seen" for a in anomalies), (
         f"expected stdout_marker_seen anomaly, got {[a['payload']['rule'] for a in anomalies]}"
     )
+
+
+def test_each_run_constructs_a_fresh_detector(tmp_path):
+    """Repeated run() calls on the same Supervisor must construct a fresh
+    detector each time. State (e.g., the bounded log_tail or any per-rule
+    counters) must not leak between runs."""
+    bang = _write_bang_fixture(tmp_path)
+    _init_repo(tmp_path)
+
+    constructed: list[AnomalyDetector] = []
+
+    def factory() -> AnomalyDetector:
+        d = _build_detector_with_marker_rule()
+        constructed.append(d)
+        return d
+
+    supervisor = Supervisor(
+        ralph_path=bang,
+        cwd=tmp_path,
+        required_tools=_all_tools_present(),
+        detector_factory=factory,
+    )
+
+    supervisor.run(issue=101)
+    supervisor.run(issue=102)
+
+    assert len(constructed) == 2
+    assert constructed[0] is not constructed[1]
+
+
+def test_default_detector_factory_isolates_runs(tmp_path):
+    """No factory injected — default behavior must still produce a fresh
+    detector per run (regression on the asymmetry the factory refactor
+    eliminates)."""
+    _init_repo(tmp_path)
+    supervisor = Supervisor(
+        ralph_path=FIXTURES / "echo_stdout.sh",
+        cwd=tmp_path,
+        required_tools=_all_tools_present(),
+    )
+    supervisor.run(issue=201)
+    supervisor.run(issue=202)
+
+    events_path = tmp_path / ".smart-ralph" / "events.jsonl"
+    entries = [json.loads(line) for line in events_path.read_text().splitlines()]
+    # Both runs landed; their run_ids differ.
+    run_ids = {e["run_id"] for e in entries}
+    assert len(run_ids) == 2
 
 
 def test_zero_exit_does_not_write_anomaly_detected(tmp_path):

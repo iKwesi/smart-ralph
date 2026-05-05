@@ -3,8 +3,8 @@ from __future__ import annotations
 import os
 import shutil
 import uuid
+from collections.abc import Callable
 from pathlib import Path
-from typing import Callable
 
 from smart_ralph.anomaly import Anomaly, AnomalyDetector
 from smart_ralph.eventlog import EventLog
@@ -37,17 +37,19 @@ class Supervisor:
         required_tools: list[str],
         retention_runs: int = 50,
         *,
-        detector: AnomalyDetector | None = None,
+        detector_factory: Callable[[], AnomalyDetector] = AnomalyDetector,
     ) -> None:
         self._ralph_path = Path(ralph_path)
         self._cwd = Path(cwd)
         self._required_tools = required_tools
         self._retention_runs = retention_runs
-        # Optional dependency injection for tests; default constructs the
-        # standard detector with the v1 built-in rule set.
-        self._detector_factory: Callable[[], AnomalyDetector] = (
-            (lambda: detector) if detector is not None else AnomalyDetector
-        )
+        # A factory (not an instance) is injected so each run() gets a
+        # fresh detector. This avoids state leaking — the bounded log_tail
+        # or any per-rule counters — across repeated runs on the same
+        # Supervisor instance. Callers that want shared state across runs
+        # can pass a factory that returns the same instance, but they opt
+        # in explicitly.
+        self._detector_factory = detector_factory
 
     def run(self, issue: int) -> tuple[int, list[dict]]:
         if not isinstance(issue, int) or issue <= 0:
