@@ -6,6 +6,8 @@ from pathlib import Path
 import pytest
 
 from smart_ralph.anomaly import Anomaly, AnomalyDetector
+from smart_ralph.eventlog import EventLog
+from smart_ralph.router import SKIP_SKILL_CHECK, DiagnosticRouter
 from smart_ralph.supervisor import ConcurrentRunError, HealthCheckError, Supervisor
 
 FIXTURES = Path(__file__).parent / "fixtures" / "fake_ralph"
@@ -420,6 +422,115 @@ def test_default_detector_factory_isolates_log_tail_across_runs(tmp_path):
             f"run {run_id} log_tail has {len(log_tail)} lines — state leaked"
             f" from a prior run (fixture prints only 3 per invocation)"
         )
+
+
+def test_supervisor_routes_anomalies_to_diagnostic_router(tmp_path):
+    """When a router_factory is injected, every anomaly the detector
+    returns is fed to DiagnosticRouter.route(). The full chain
+    anomaly_detected → diagnosis_started → diagnosis_completed must
+    appear in events.jsonl in that order."""
+    canned = (
+        '<diagnosis>'
+        '{"scope":"orchestrator",'
+        '"fix_type":"state_patch",'
+        '"action":{},'
+        '"confidence":"high",'
+        '"summary":"x",'
+        '"evidence":{}}'
+        '</diagnosis>'
+    )
+
+    class _CannedProvider:
+        def run_headless(self, prompt, *, allowed_tools):
+            return canned
+
+    def router_factory(log: EventLog) -> DiagnosticRouter:
+        return DiagnosticRouter(provider=_CannedProvider(), event_log=log)
+
+    _init_repo(tmp_path)
+    supervisor = Supervisor(
+        ralph_path=FIXTURES / "exits_nonzero.sh",
+        cwd=tmp_path,
+        required_tools=_all_tools_present(),
+        router_factory=router_factory,
+    )
+    supervisor.run(issue=42)
+
+    events_path = tmp_path / ".smart-ralph" / "events.jsonl"
+    types = [
+        json.loads(line)["type"]
+        for line in events_path.read_text().splitlines()
+    ]
+
+    assert "anomaly_detected" in types
+    assert "diagnosis_started" in types
+    assert "diagnosis_completed" in types
+
+    # Diagnostic events must come AFTER the anomaly that triggered them.
+    anomaly_idx = types.index("anomaly_detected")
+    started_idx = types.index("diagnosis_started")
+    completed_idx = types.index("diagnosis_completed")
+    assert anomaly_idx < started_idx < completed_idx
+
+
+def test_router_exception_does_not_kill_supervisor_run(tmp_path):
+    """A misbehaving router (provider crash, network, anything) must not
+    take the whole orchestration down. Failure is logged as
+    diagnosis_failed and the supervisor continues normally."""
+
+    class _ExplodingProvider:
+        def run_headless(self, prompt, *, allowed_tools):
+            raise RuntimeError("simulated provider explosion")
+
+    def router_factory(log: EventLog) -> DiagnosticRouter:
+        return DiagnosticRouter(
+            provider=_ExplodingProvider(),
+            event_log=log,
+            skill_path=SKIP_SKILL_CHECK,
+        )
+
+    _init_repo(tmp_path)
+    supervisor = Supervisor(
+        ralph_path=FIXTURES / "exits_nonzero.sh",
+        cwd=tmp_path,
+        required_tools=_all_tools_present(),
+        router_factory=router_factory,
+    )
+    exit_code, _ = supervisor.run(issue=77)
+    # Run completes; ralph's exit code is what surfaces.
+    assert exit_code == 1
+
+    events_path = tmp_path / ".smart-ralph" / "events.jsonl"
+    types = [
+        json.loads(line)["type"]
+        for line in events_path.read_text().splitlines()
+    ]
+    assert "anomaly_detected" in types
+    assert "diagnosis_failed" in types
+    # Supervisor's lifecycle terminates cleanly.
+    assert types[-1] == "run_ended"
+
+
+def test_supervisor_without_router_factory_logs_anomaly_only(tmp_path):
+    """Default behaviour with no router_factory: anomaly_detected lands
+    but no diagnostic events fire (graceful degradation when the diagnose
+    pathway isn't configured)."""
+    _init_repo(tmp_path)
+    supervisor = Supervisor(
+        ralph_path=FIXTURES / "exits_nonzero.sh",
+        cwd=tmp_path,
+        required_tools=_all_tools_present(),
+    )
+    supervisor.run(issue=43)
+
+    events_path = tmp_path / ".smart-ralph" / "events.jsonl"
+    types = [
+        json.loads(line)["type"]
+        for line in events_path.read_text().splitlines()
+    ]
+    assert "anomaly_detected" in types
+    assert "diagnosis_started" not in types
+    assert "diagnosis_completed" not in types
 
 
 def test_zero_exit_does_not_write_anomaly_detected(tmp_path):

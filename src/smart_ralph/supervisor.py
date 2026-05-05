@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import shutil
+import traceback
 import uuid
 from collections.abc import Callable
 from pathlib import Path
@@ -9,6 +10,7 @@ from pathlib import Path
 from smart_ralph.anomaly import Anomaly, AnomalyDetector
 from smart_ralph.eventlog import EventLog
 from smart_ralph.ralph_client import RalphClient
+from smart_ralph.router import DiagnosticRouter
 
 
 class ConcurrentRunError(RuntimeError):
@@ -46,6 +48,7 @@ class Supervisor:
         retention_runs: int = 50,
         *,
         detector_factory: Callable[[], AnomalyDetector] = _default_detector_factory,
+        router_factory: Callable[[EventLog], DiagnosticRouter] | None = None,
     ) -> None:
         self._ralph_path = Path(ralph_path)
         self._cwd = Path(cwd)
@@ -58,6 +61,11 @@ class Supervisor:
         # can pass a factory that returns the same instance, but they opt
         # in explicitly.
         self._detector_factory = detector_factory
+        # Optional: when wired, every Anomaly the detector returns is
+        # routed through DiagnosticRouter. Default None → graceful
+        # degradation; the supervisor still records anomaly_detected
+        # events but skips routing entirely.
+        self._router_factory = router_factory
 
     def run(self, issue: int) -> tuple[int, list[dict]]:
         if not isinstance(issue, int) or issue <= 0:
@@ -91,6 +99,7 @@ class Supervisor:
         log = EventLog(meta_dir / "events.jsonl", run_id=run_id)
         log.prune_runs(keep=self._retention_runs)
         detector = self._detector_factory()
+        router = self._router_factory(log) if self._router_factory is not None else None
         process = None
         exit_code = 1
         events: list[dict] = []
@@ -103,6 +112,32 @@ class Supervisor:
                     payload={"rule": a.rule, "evidence": a.evidence},
                     sync=True,
                 )
+                if router is not None:
+                    # Context is intentionally minimal in this slice — the
+                    # router builds its prompt from anomaly + context. Richer
+                    # state-snapshot context lands when state.json reading
+                    # is wired (issue #9 territory).
+                    #
+                    # A routing failure (provider timeout, network, parser
+                    # crash, etc.) must never take the whole supervised run
+                    # down. We log it as diagnosis_failed and continue.
+                    try:
+                        router.route(a, context={"issue": a.issue})
+                    except Exception as e:
+                        # Include the full traceback so operators can
+                        # locate the failure without re-running with a
+                        # debugger. EventLog auto-offloads >4KB to a
+                        # blob, so even a long traceback is safe.
+                        log.append(
+                            event_type="diagnosis_failed", source="supervisor",
+                            issue=a.issue,
+                            payload={
+                                "reason": "router_exception",
+                                "error": f"{type(e).__name__}: {e}",
+                                "traceback": traceback.format_exc(),
+                            },
+                            sync=True,
+                        )
 
         try:
             log.append(
