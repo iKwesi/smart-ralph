@@ -54,13 +54,25 @@ class EventLog:
 
     def _offload_payload(self, payload: dict[str, Any]) -> dict[str, Any]:
         """Write payload to a blob under blobs/<run_id>/ and return a tiny
-        replacement payload that references it via blob_ref."""
+        replacement payload that references it via blob_ref.
+
+        The Python writer uses uuid4 hex for filenames; the bash writer in
+        lib/ralph-events.sh uses <ts_digits>-<pid>-<random>.json because
+        bash needs platform-portable name uniqueness without a uuid library.
+        Both schemes produce unique paths inside the same blobs/<run_id>/
+        directory; readers should not parse the filename.
+        """
         events_root = self._path.parent
         blob_dir = events_root / "blobs" / self._run_id
         blob_dir.mkdir(parents=True, exist_ok=True)
         blob_name = f"{uuid.uuid4().hex}.json"
         blob_path = blob_dir / blob_name
-        blob_path.write_text(json.dumps(payload, separators=(",", ":")))
+        # Atomic write: stage to a sibling .tmp file, fsync, then rename.
+        # Prevents readers from seeing a truncated blob if we crash between
+        # opening the file and finishing the write.
+        tmp_path = blob_path.with_suffix(blob_path.suffix + ".tmp")
+        tmp_path.write_text(json.dumps(payload, separators=(",", ":")))
+        os.replace(tmp_path, blob_path)
         # Path is relative to events_root so readers can resolve it without
         # needing to know the writer's cwd.
         return {"oversized": True, "blob_ref": f"blobs/{self._run_id}/{blob_name}"}

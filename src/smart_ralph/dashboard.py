@@ -49,8 +49,8 @@ class Dashboard:
             top_lines.append(f"[bold red]ANOMALY:[/bold red] {rule}")
         top_body = "\n".join(top_lines)
         bottom_body = "\n".join(state["stdout_tail"]) or "(no output yet)"
-        # Make room for the optional anomaly row.
-        top_size = 7 if state["anomaly"] is not None else 6
+        # Panel needs room for the content rows + 2 border rows + 1 padding row.
+        top_size = len(top_lines) + 3
         layout = Layout()
         layout.split_column(
             Layout(Panel(top_body, title="Progress"), size=top_size),

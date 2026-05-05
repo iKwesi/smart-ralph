@@ -303,6 +303,56 @@ def test_nonzero_ralph_exit_writes_anomaly_detected_event(tmp_path):
     assert len(run_ids) == 1
 
 
+def test_stdout_stream_anomalies_are_recorded_not_just_at_exit(tmp_path, monkeypatch):
+    """Anomalies returned while the supervisor is draining ralph's stdout
+    must be written to events.jsonl too — not silently dropped because the
+    loop only records on ralph_exited."""
+    from smart_ralph import anomaly as anomaly_module
+
+    def stdout_marker_rule(event, _ctx):
+        if event.get("type") != "ralph_stdout":
+            return None
+        if "BANG" not in event.get("payload", {}).get("line", ""):
+            return None
+        return anomaly_module.Anomaly(
+            rule="stdout_marker_seen",
+            issue=event.get("issue"),
+            evidence={"line": event["payload"]["line"]},
+        )
+
+    # Patch AnomalyDetector to register our rule by default for this test.
+    original_init = anomaly_module.AnomalyDetector.__init__
+
+    def patched_init(self):
+        original_init(self)
+        self.register(stdout_marker_rule)
+
+    monkeypatch.setattr(anomaly_module.AnomalyDetector, "__init__", patched_init)
+
+    # fixture stub that prints a stdout line containing "BANG", then exits 0
+    bang = tmp_path / "bang.sh"
+    bang.write_text(
+        '#!/usr/bin/env bash\n'
+        'echo "BANG goes the issue"\n'
+        'echo "ok"\n'
+    )
+    bang.chmod(0o755)
+
+    _init_repo(tmp_path)
+    Supervisor(
+        ralph_path=bang,
+        cwd=tmp_path,
+        required_tools=_all_tools_present(),
+    ).run(issue=99)
+
+    events_path = tmp_path / ".smart-ralph" / "events.jsonl"
+    entries = [json.loads(line) for line in events_path.read_text().splitlines()]
+    anomalies = [e for e in entries if e["type"] == "anomaly_detected"]
+    assert any(a["payload"]["rule"] == "stdout_marker_seen" for a in anomalies), (
+        f"expected stdout_marker_seen anomaly, got {[a['payload']['rule'] for a in anomalies]}"
+    )
+
+
 def test_zero_exit_does_not_write_anomaly_detected(tmp_path):
     _init_repo(tmp_path)
     supervisor = Supervisor(

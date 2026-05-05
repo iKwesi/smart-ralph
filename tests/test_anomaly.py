@@ -96,3 +96,26 @@ def test_anomaly_log_tail_is_empty_when_no_stdout_seen():
     anomaly = detector.observe(_ralph_exited(exit_code=1))[0]
 
     assert anomaly.evidence["log_tail"] == []
+
+
+# ── register(rule): pluggable rule registration ────────────
+
+def test_register_adds_a_custom_rule_that_fires_alongside_defaults():
+    """Custom rules registered via register() must be invoked on every
+    observe() call alongside the built-in rule set."""
+    from smart_ralph.anomaly import Anomaly
+
+    detector = AnomalyDetector()
+
+    def fires_on_run_started(event, _ctx):
+        if event.get("type") == "run_started":
+            return Anomaly(rule="custom_run_started", issue=event.get("issue"))
+        return None
+
+    detector.register(fires_on_run_started)
+
+    event = {"type": "run_started", "issue": 5, "payload": {}}
+    anomalies = detector.observe(event)
+
+    rules = {a.rule for a in anomalies}
+    assert "custom_run_started" in rules

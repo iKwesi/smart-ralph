@@ -105,7 +105,7 @@ class Supervisor:
             events = []
             for evt in process.events():
                 events.append(evt)
-                detector.observe(evt)
+                _record_anomalies(detector.observe(evt))
             exit_code = process.wait()
             ralph_exited_event = {
                 "type": "ralph_exited",

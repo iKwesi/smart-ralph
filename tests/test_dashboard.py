@@ -1,4 +1,5 @@
 import io
+import re
 
 from smart_ralph.dashboard import Dashboard
 
@@ -81,9 +82,12 @@ def test_anomaly_detected_renders_prominent_in_attached_mode():
 
     out = tty.getvalue()
     assert "ralph_nonzero_exit" in out
-    # Rich emits ANSI escapes for red — accept either the SGR code or a
-    # literal "anomaly" marker word so the test isn't tied to one renderer.
-    assert ("\x1b[31m" in out) or ("\x1b[91m" in out) or ("ANOMALY" in out.upper())
+    # Rich emits an ANSI red SGR escape when rendering [bold red] markup.
+    # The exact form may be \x1b[31m, \x1b[91m, or combined like
+    # \x1b[1;31m (bold + red), so look for the color code (31 / 91)
+    # appearing inside any SGR escape.
+    sgr_red = re.search(r"\x1b\[[0-9;]*?(?:31|91)[0-9;]*m", out)
+    assert sgr_red, f"expected red ANSI in dashboard output, got: {out!r}"
 
 
 def test_anomaly_detected_in_plain_mode_writes_one_line():

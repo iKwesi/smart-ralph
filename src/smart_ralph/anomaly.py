@@ -35,7 +35,9 @@ Rule = Callable[[Event, Context], "Anomaly | None"]
 #   130 — SIGINT, user-initiated shutdown
 _NORMAL_EXIT_CODES = frozenset({0, 42, 130})
 
-LOG_TAIL_MAX_LINES = 100
+# Internal — the bounded stdout tail size is an implementation detail of
+# the detector's evidence collection, not a public knob.
+_LOG_TAIL_MAX_LINES = 100
 
 
 def _ralph_nonzero_exit(event: Event, context: Context) -> Anomaly | None:
@@ -57,7 +59,7 @@ def _ralph_nonzero_exit(event: Event, context: Context) -> Anomaly | None:
 class AnomalyDetector:
     def __init__(self) -> None:
         self._rules: list[Rule] = [_ralph_nonzero_exit]
-        self._log_tail: Deque[str] = deque(maxlen=LOG_TAIL_MAX_LINES)
+        self._log_tail: Deque[str] = deque(maxlen=_LOG_TAIL_MAX_LINES)
 
     def register(self, rule: Rule) -> None:
         self._rules.append(rule)
